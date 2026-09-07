@@ -11,7 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"clickeliclick/internal/clickhouse"
+	"clickeliclick/internal/app"
+	"clickeliclick/internal/pkg/clickhouse"
 )
 
 func main() {
@@ -29,6 +30,8 @@ func main() {
 	}
 	defer ch.Close()
 
+	repo := app.NewRepository(ch)
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -38,12 +41,12 @@ func main() {
 	// POST /events with a JSON array of events, e.g.
 	// [{"user_id":1,"event_type":"click","payload":"{}"}]
 	mux.HandleFunc("POST /events", func(w http.ResponseWriter, r *http.Request) {
-		var events []clickhouse.Event
+		var events []app.Event
 		if err := json.NewDecoder(r.Body).Decode(&events); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := ch.InsertEvents(r.Context(), events); err != nil {
+		if err := repo.InsertEvents(r.Context(), events); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -51,7 +54,7 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
-		events, err := ch.RecentEvents(r.Context(), 50)
+		events, err := repo.RecentEvents(r.Context(), 50)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -60,7 +63,7 @@ func main() {
 	})
 
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
-		counts, err := ch.CountByType(r.Context())
+		counts, err := repo.CountByType(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

@@ -5,7 +5,9 @@ Minimal Go + ClickHouse playground.
 ## Layout
 
 - `cmd/server/main.go` — tiny HTTP service (insert / query / aggregate)
-- `internal/clickhouse/client.go` — ClickHouse client wrapper (native protocol, batch inserts, parameterised queries)
+- `internal/app/` — `Event` entity and the `Repository` that owns the SQL (batch inserts, parameterised queries)
+- `internal/pkg/clickhouse/client.go` — thin wrapper around the native ClickHouse connection
+- `internal/pkg/clickhouse/clickhousetest/` — throwaway ClickHouse container for integration tests
 - `migrations/001_events.sql` — schema, auto-applied by the container on first start
 - `docker-compose.yml` — local ClickHouse server
 
@@ -46,7 +48,7 @@ open http://localhost:8123/dashboard      # web dashboard UI with metrics
 
 ## Tests
 
-Integration tests live in `internal/clickhouse/client_test.go`. They start a throwaway ClickHouse via
+Integration tests live in `internal/app/repository_test.go`. They start a throwaway ClickHouse via
 [testcontainers-go](https://golang.testcontainers.org/modules/clickhouse/), apply `migrations/001_events.sql`,
 and exercise the client with `testify/require`. One container is shared across the package; each test
 truncates the table first.
