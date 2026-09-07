@@ -170,3 +170,42 @@ func TestCountByTypeEmpty(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, counts)
 }
+
+func TestStatsPerMinute(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	m0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	m1 := m0.Add(time.Minute)
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		{TS: m0, UserID: 1, EventType: "view"},
+		{TS: m0.Add(10 * time.Second), UserID: 1, EventType: "view"}, // same user again
+		{TS: m0.Add(20 * time.Second), UserID: 2, EventType: "view"},
+		{TS: m0.Add(30 * time.Second), UserID: 2, EventType: "click"},
+		{TS: m1, UserID: 3, EventType: "view"},
+	}))
+
+	got, err := repo.StatsPerMinute(ctx, m0, m1.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []MinuteStats{
+		{Minute: m0, EventType: "click", Events: 1, Users: 1},
+		{Minute: m0, EventType: "view", Events: 3, Users: 2},
+		{Minute: m1, EventType: "view", Events: 1, Users: 1},
+	}, got)
+}
+
+// Two separate inserts for the same minute produce two rows of partial state
+// in the rollup. countMerge/uniqMerge with GROUP BY combine them correctly
+// whether or not a background merge has happened yet.
+func TestStatsPerMinuteMergesAcrossInserts(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	m0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, repo.InsertEvents(ctx, []Event{{TS: m0, UserID: 1, EventType: "view"}}))
+	require.NoError(t, repo.InsertEvents(ctx, []Event{{TS: m0, UserID: 1, EventType: "view"}, {TS: m0, UserID: 2, EventType: "view"}}))
+
+	got, err := repo.StatsPerMinute(ctx, m0, m0.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []MinuteStats{{Minute: m0, EventType: "view", Events: 3, Users: 2}}, got)
+}

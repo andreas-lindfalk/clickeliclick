@@ -27,7 +27,8 @@ curl -X POST localhost:8080/events -d '[{"user_id":1,"event_type":"click","paylo
 curl -X POST localhost:8080/event -d '{"user_id":1,"event_type":"click","payload":"{}"}'   # single row, async insert
 curl localhost:8080/events
 curl localhost:8080/users/42/events
-curl localhost:8080/stats
+curl localhost:8080/stats                                   # aggregates the raw table
+curl "localhost:8080/stats/minutes?from=2026-09-01T00:00:00Z&to=2026-09-01T01:00:00Z"   # reads the rollup
 ```
 
 Load some real volume so queries have something to work on:
@@ -149,6 +150,59 @@ OPTIMIZE TABLE events FINAL;
 ALTER TABLE events ADD INDEX user_bf user_id TYPE bloom_filter GRANULARITY 1;
 ALTER TABLE events MATERIALIZE INDEX user_bf SETTINGS mutations_sync = 1;
 ALTER TABLE events DROP INDEX user_bf;
+```
+
+## Pre-aggregating with materialized views
+
+A materialized view in ClickHouse is an **insert trigger**, not a cached query. Every batch
+written to `events` also runs through the view's SELECT, and the result is appended to a target
+table. The view never reads existing rows, so migration 003 backfills the target separately.
+
+The target `events_per_minute` is an `AggregatingMergeTree` holding *partial aggregate states*:
+a `countState()` and a `uniqState(user_id)` per minute and event type. Two inserts for the same
+minute produce two rows of state; background merges combine rows with the same key by merging
+states. That is why the rollup is always read with `GROUP BY` and the `-Merge` combinators:
+
+```sql
+SELECT minute, event_type, countMerge(events), uniqMerge(users)
+FROM events_per_minute GROUP BY minute, event_type;
+```
+
+States merge across buckets as well, so the same table answers per-hour or per-day questions.
+
+Measured on the 5M seeded rows, hourly buckets over 30 days:
+
+| question | source | rows read | bytes | time |
+|---|---|---|---|---|
+| count per hour/type | `events` | 5.0M | 43 MiB | 64 ms |
+| count per hour/type | rollup | 130k | 2.6 MiB | 9 ms |
+| count + uniq users per hour/type | `events` | 5.0M | 81 MiB | 154 ms |
+| count + uniq users per hour/type | rollup | 130k | 13 MiB | 192 ms |
+
+The count wins outright. The uniques do not, and the reason is worth understanding: the
+`users` column is 15 of the rollup's 20 MiB. Each per-minute bucket holds only ~39 users, so its
+sketch is about as big as the raw ids it summarises, and merging 130k sketches costs more than
+hashing 5M integers. A rollup pays off when raw rows per bucket is large; here it is 38. At a
+hundred times the event volume the rollup would be the same size and the raw scan a hundred
+times bigger. Coarser buckets (per hour) or dropping the uniq state are the fixes.
+
+Try it yourself:
+
+```sql
+-- the view and its target
+SHOW CREATE TABLE events_per_minute_mv;
+
+-- partial states before and after a merge: insert the same minute twice, then
+SELECT minute, event_type, count() AS state_rows FROM events_per_minute
+WHERE minute >= toStartOfMinute(now()) GROUP BY minute, event_type;
+OPTIMIZE TABLE events_per_minute FINAL;  -- and run the SELECT again
+
+-- reading a state column directly gives you the binary blob, hence -Merge
+SELECT minute, events, users FROM events_per_minute LIMIT 1 FORMAT Vertical;
+
+-- what the states cost on disk
+SELECT name, formatReadableSize(data_compressed_bytes) FROM system.columns
+WHERE database = 'poc' AND table = 'events_per_minute';
 ```
 
 ## Tests

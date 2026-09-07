@@ -20,3 +20,12 @@ type EventColumns struct {
 	EventType []string
 	Payload   []string
 }
+
+// MinuteStats is one row of the events_per_minute rollup, with the aggregate
+// states already merged into plain numbers.
+type MinuteStats struct {
+	Minute    time.Time `json:"minute"`
+	EventType string    `json:"event_type"`
+	Events    uint64    `json:"events"`
+	Users     uint64    `json:"users"`
+}

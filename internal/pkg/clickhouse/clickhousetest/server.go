@@ -55,8 +55,9 @@ func Start(ctx context.Context) (*Server, error) {
 	return &Server{Container: ctr, cfg: c}, nil
 }
 
-// NewClient connects to the server and truncates the events table so each
-// test starts from a clean slate.
+// NewClient connects to the server and truncates every data table so each
+// test starts from a clean slate. Materialized views are not tables and keep
+// working; goose's version table is left alone.
 func (s *Server) NewClient(t *testing.T) *clickhouse.Client {
 	t.Helper()
 	ctx := context.Background()
@@ -65,7 +66,19 @@ func (s *Server) NewClient(t *testing.T) *clickhouse.Client {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, c.Close()) })
 
-	require.NoError(t, c.Exec(ctx, "TRUNCATE TABLE events"))
+	rows, err := c.Query(ctx, `SELECT name FROM system.tables
+		WHERE database = currentDatabase() AND engine LIKE '%MergeTree' AND name != 'goose_db_version'`)
+	require.NoError(t, err)
+	var tables []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		tables = append(tables, name)
+	}
+	require.NoError(t, rows.Close())
+	for _, name := range tables {
+		require.NoError(t, c.Exec(ctx, "TRUNCATE TABLE "+name))
+	}
 	return c
 }
 

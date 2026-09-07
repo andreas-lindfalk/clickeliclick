@@ -82,7 +82,7 @@ func (r *Repository) RecentEvents(ctx context.Context, n int) ([]Event, error) {
 	}
 	defer rows.Close()
 
-	var out []Event
+	out := []Event{}
 	for rows.Next() {
 		var e Event
 		if err := rows.Scan(&e.TS, &e.UserID, &e.EventType, &e.Payload); err != nil {
@@ -106,7 +106,7 @@ func (r *Repository) RecentEventsByUser(ctx context.Context, userID uint64, n in
 	}
 	defer rows.Close()
 
-	var out []Event
+	out := []Event{}
 	for rows.Next() {
 		var e Event
 		if err := rows.Scan(&e.TS, &e.UserID, &e.EventType, &e.Payload); err != nil {
@@ -133,6 +133,38 @@ func (r *Repository) CountByType(ctx context.Context) (map[string]uint64, error)
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		out[t] = n
+	}
+	return out, rows.Err()
+}
+
+// StatsPerMinute reads the events_per_minute rollup for [from, to).
+//
+// The rollup stores partial aggregate states, and the same minute can exist in
+// several parts until a background merge combines them, so reading it always
+// means GROUP BY the key plus the -Merge combinators. Reading the columns
+// directly would return binary state blobs.
+func (r *Repository) StatsPerMinute(ctx context.Context, from, to time.Time) ([]MinuteStats, error) {
+	rows, err := r.client.Query(ctx, `
+		SELECT minute, event_type, countMerge(events) AS events, uniqMerge(users) AS users
+		FROM events_per_minute
+		WHERE minute >= {from:DateTime} AND minute < {to:DateTime}
+		GROUP BY minute, event_type
+		ORDER BY minute, event_type`,
+		cl.Named("from", from.UTC().Format(time.DateTime)),
+		cl.Named("to", to.UTC().Format(time.DateTime)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query events_per_minute: %w", err)
+	}
+	defer rows.Close()
+
+	out := []MinuteStats{}
+	for rows.Next() {
+		var m MinuteStats
+		if err := rows.Scan(&m.Minute, &m.EventType, &m.Events, &m.Users); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		out = append(out, m)
 	}
 	return out, rows.Err()
 }

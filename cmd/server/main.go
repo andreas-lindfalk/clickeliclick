@@ -105,6 +105,31 @@ func main() {
 	if httpAddr == "" {
 		httpAddr = ":8080"
 	}
+	// GET /stats/minutes?from=RFC3339&to=RFC3339, defaulting to the last hour.
+	// Served from the events_per_minute rollup, not the raw table.
+	mux.HandleFunc("GET /stats/minutes", func(w http.ResponseWriter, r *http.Request) {
+		to, from := time.Now(), time.Now().Add(-time.Hour)
+		var err error
+		if v := r.URL.Query().Get("from"); v != "" {
+			if from, err = time.Parse(time.RFC3339, v); err != nil {
+				http.Error(w, "from: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if v := r.URL.Query().Get("to"); v != "" {
+			if to, err = time.Parse(time.RFC3339, v); err != nil {
+				http.Error(w, "to: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		stats, err := repo.StatsPerMinute(r.Context(), from, to)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, stats)
+	})
+
 	srv := &http.Server{Addr: httpAddr, Handler: mux}
 
 	go func() {
