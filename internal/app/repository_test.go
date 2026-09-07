@@ -87,6 +87,27 @@ func TestInsertDefaultsTimestamp(t *testing.T) {
 	require.True(t, got[0].TS.After(before), "zero TS should be filled with now()")
 }
 
+func TestRecentEventsByUser(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		{TS: base, UserID: 1, EventType: "view", Payload: "first"},
+		{TS: base.Add(time.Second), UserID: 2, EventType: "view", Payload: "other user"},
+		{TS: base.Add(2 * time.Second), UserID: 1, EventType: "click", Payload: "second"},
+	}))
+
+	got, err := repo.RecentEventsByUser(ctx, 1, 10)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, "second", got[0].Payload)
+	require.Equal(t, "first", got[1].Payload)
+	for _, e := range got {
+		require.Equal(t, uint64(1), e.UserID)
+	}
+}
+
 func TestInsertEventColumns(t *testing.T) {
 	repo := NewRepository(testServer.NewClient(t))
 	ctx := context.Background()

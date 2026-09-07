@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -70,6 +71,20 @@ func main() {
 
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 		events, err := repo.RecentEvents(r.Context(), 50)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, events)
+	})
+
+	mux.HandleFunc("GET /users/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid user id", http.StatusBadRequest)
+			return
+		}
+		events, err := repo.RecentEventsByUser(r.Context(), id, 50)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

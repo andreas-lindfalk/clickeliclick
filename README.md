@@ -26,6 +26,7 @@ Poke it:
 curl -X POST localhost:8080/events -d '[{"user_id":1,"event_type":"click","payload":"{}"},{"user_id":2,"event_type":"view","payload":"{}"}]'
 curl -X POST localhost:8080/event -d '{"user_id":1,"event_type":"click","payload":"{}"}'   # single row, async insert
 curl localhost:8080/events
+curl localhost:8080/users/42/events
 curl localhost:8080/stats
 ```
 
@@ -95,6 +96,60 @@ Add a new file as `migrations/00N_name.sql` with `-- +goose Up` / `-- +goose Dow
 | `CLICKHOUSE_USER`     | `default`        |
 | `CLICKHOUSE_PASSWORD` | empty            |
 | `HTTP_ADDR`           | `:8080`          |
+
+## Reading less
+
+ClickHouse has no row-level index. Each part is sorted by the table's `ORDER BY`, and a sparse
+primary index stores one entry per *granule* of 8192 rows. A query can only skip granules the
+sort order lets it exclude, so the sort key is the single biggest performance decision.
+
+`events` is sorted by `(event_type, user_id, ts)`. Filtering on `event_type` prunes well. Filtering
+on `user_id` alone is weaker: the index is sorted by event type first, so ClickHouse falls back to a
+"generic exclusion search" over the second column. Migration 002 adds a **projection**, a hidden copy
+of the data inside each part sorted by `(user_id, ts)`, which the planner picks automatically.
+
+Measured on the 5M seeded rows, `SELECT ... WHERE user_id = 42 ORDER BY ts DESC LIMIT 50`:
+
+| | granules read | rows read | bytes | time |
+|---|---|---|---|---|
+| primary key only | 22 / 613 | 279k | 4.9 MiB | 18 ms |
+| + bloom filter skip index on user_id | 15 / 613 | | | |
+| + projection `by_user` | 8 / 613 | 115k | 1.0 MiB | 5 ms |
+
+The projection costs about as much disk as the table itself (73 MiB on top of 74 MiB), since it is a
+full second copy. Eight granules is the floor with eight parts: one granule per part, so fewer
+parts means fewer reads.
+
+Try it yourself:
+
+```sql
+-- what the planner does, and which index pruned what
+EXPLAIN indexes = 1
+SELECT ts, user_id, event_type, payload FROM events WHERE user_id = 42 ORDER BY ts DESC LIMIT 50;
+
+-- force the old path to compare
+EXPLAIN indexes = 1
+SELECT ts, user_id, event_type, payload FROM events WHERE user_id = 42 ORDER BY ts DESC LIMIT 50
+SETTINGS optimize_use_projections = 0;
+
+-- what a query actually read, and which projection it used
+SYSTEM FLUSH LOGS;
+SELECT read_rows, read_bytes, query_duration_ms, ProfileEvents['SelectedMarks'] AS marks, projections
+FROM system.query_log WHERE type = 'QueryFinish' AND query LIKE '%user_id = 42%'
+ORDER BY event_time DESC LIMIT 3;
+
+-- what the projection costs
+SELECT name, count() AS parts, formatReadableSize(sum(bytes_on_disk)) AS on_disk
+FROM system.projection_parts WHERE table = 'events' AND active GROUP BY name;
+
+-- merge everything into one part per partition and re-run the EXPLAIN
+OPTIMIZE TABLE events FINAL;
+
+-- a skip index is the other tool; here it helps a little, a projection helps a lot
+ALTER TABLE events ADD INDEX user_bf user_id TYPE bloom_filter GRANULARITY 1;
+ALTER TABLE events MATERIALIZE INDEX user_bf SETTINGS mutations_sync = 1;
+ALTER TABLE events DROP INDEX user_bf;
+```
 
 ## Tests
 

@@ -93,6 +93,30 @@ func (r *Repository) RecentEvents(ctx context.Context, n int) ([]Event, error) {
 	return out, rows.Err()
 }
 
+// RecentEventsByUser returns the latest n rows for one user. Served from the
+// by_user projection, which is sorted by (user_id, ts); see migration 002.
+func (r *Repository) RecentEventsByUser(ctx context.Context, userID uint64, n int) ([]Event, error) {
+	rows, err := r.client.Query(ctx,
+		"SELECT ts, user_id, event_type, payload FROM events WHERE user_id = {user_id:UInt64} ORDER BY ts DESC LIMIT {n:UInt32}",
+		cl.Named("user_id", userID),
+		cl.Named("n", uint32(n)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query events by user: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.TS, &e.UserID, &e.EventType, &e.Payload); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // CountByType is a small aggregation example.
 func (r *Repository) CountByType(ctx context.Context) (map[string]uint64, error) {
 	rows, err := r.client.Query(ctx, "SELECT event_type, count() FROM events GROUP BY event_type ORDER BY event_type")
