@@ -7,8 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -19,7 +17,7 @@ import (
 )
 
 const (
-	image    = "clickhouse/clickhouse-server:latest"
+	image    = "clickhouse/clickhouse-server:26.8"
 	database = "poc"
 	user     = "default"
 	password = "test"
@@ -39,7 +37,6 @@ func Start(ctx context.Context) (*Server, error) {
 		tcclickhouse.WithDatabase(database),
 		tcclickhouse.WithUsername(user),
 		tcclickhouse.WithPassword(password),
-		tcclickhouse.WithInitScripts(migrationPath("001_events.sql")),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("run clickhouse container: %w", err)
@@ -51,6 +48,10 @@ func Start(ctx context.Context) (*Server, error) {
 			fmt.Errorf("connection host: %w", err),
 			testcontainers.TerminateContainer(ctr),
 		)
+	}
+
+	if err := clickhouse.Migrate(ctx, addr, database, user, password); err != nil {
+		return nil, errors.Join(err, testcontainers.TerminateContainer(ctr))
 	}
 
 	return &Server{Container: ctr, addr: addr}, nil
@@ -77,12 +78,4 @@ func (s *Server) Close() error {
 		return nil
 	}
 	return testcontainers.TerminateContainer(s.Container)
-}
-
-// migrationPath resolves a file under <module root>/migrations relative to
-// this source file, so it works from any test package regardless of depth.
-func migrationPath(name string) string {
-	_, file, _, _ := runtime.Caller(0)
-	root := filepath.Join(filepath.Dir(file), "..", "..", "..", "..")
-	return filepath.Join(root, "migrations", name)
 }

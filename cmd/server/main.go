@@ -19,12 +19,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	ch, err := clickhouse.New(ctx,
-		env("CLICKHOUSE_ADDR", "localhost:9000"),
-		env("CLICKHOUSE_DB", "poc"),
-		env("CLICKHOUSE_USER", "default"),
-		env("CLICKHOUSE_PASSWORD", ""),
-	)
+	addr := env("CLICKHOUSE_ADDR", "localhost:9000")
+	database := env("CLICKHOUSE_DB", "poc")
+	user := env("CLICKHOUSE_USER", "default")
+	password := env("CLICKHOUSE_PASSWORD", "")
+
+	if err := clickhouse.Migrate(ctx, addr, database, user, password); err != nil {
+		log.Fatal(err)
+	}
+
+	ch, err := clickhouse.New(ctx, addr, database, user, password)
 	if err != nil {
 		log.Fatal(err)
 	}

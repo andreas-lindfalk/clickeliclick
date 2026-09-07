@@ -8,7 +8,8 @@ Minimal Go + ClickHouse playground.
 - `internal/app/` — `Event` entity and the `Repository` that owns the SQL (batch inserts, parameterised queries)
 - `internal/pkg/clickhouse/client.go` — thin wrapper around the native ClickHouse connection
 - `internal/pkg/clickhouse/clickhousetest/` — throwaway ClickHouse container for integration tests
-- `migrations/001_events.sql` — schema, auto-applied by the container on first start
+- `migrations/` — goose SQL migrations, embedded into the binary and applied on service startup and in tests
+- `internal/pkg/clickhouse/migrate.go` — runs the embedded migrations with goose
 - `docker-compose.yml` — local ClickHouse server
 
 ## Run
@@ -34,7 +35,10 @@ open http://localhost:8123/play           # web query UI
 open http://localhost:8123/dashboard      # web dashboard UI with metrics
 ```
 
-`make down` stops the server and wipes the data volume, so the migration reruns next time.
+Migrations run every time the service starts; goose tracks what is applied in `poc.goose_db_version`.
+Add a new file as `migrations/00N_name.sql` with `-- +goose Up` / `-- +goose Down` sections.
+
+`make down` stops the server and wipes the data volume.
 
 ## Config
 
@@ -49,7 +53,7 @@ open http://localhost:8123/dashboard      # web dashboard UI with metrics
 ## Tests
 
 Integration tests live in `internal/app/repository_test.go`. They start a throwaway ClickHouse via
-[testcontainers-go](https://golang.testcontainers.org/modules/clickhouse/), apply `migrations/001_events.sql`,
+[testcontainers-go](https://golang.testcontainers.org/modules/clickhouse/), run the embedded migrations,
 and exercise the client with `testify/require`. One container is shared across the package; each test
 truncates the table first.
 

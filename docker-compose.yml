@@ -1,6 +1,6 @@
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:26.8
     ports:
       - "8123:8123" # HTTP interface (curl, clickhouse-client via HTTP, browser at /play)
       - "9000:9000" # native TCP interface (used by the Go client)
@@ -15,7 +15,6 @@ services:
         hard: 262144
     volumes:
       - clickhouse-data:/var/lib/clickhouse
-      - ./migrations:/docker-entrypoint-initdb.d # runs *.sql on first start only
 
 volumes:
   clickhouse-data:

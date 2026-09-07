@@ -16,12 +16,7 @@ type Client struct {
 
 // New opens a native-protocol connection and pings it.
 func New(ctx context.Context, addr, database, user, password string) (*Client, error) {
-	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr:        []string{addr},
-		Auth:        clickhouse.Auth{Database: database, Username: user, Password: password},
-		Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
-		DialTimeout: 5 * time.Second,
-	})
+	conn, err := clickhouse.Open(options(addr, database, user, password))
 	if err != nil {
 		return nil, fmt.Errorf("open clickhouse: %w", err)
 	}
@@ -29,4 +24,13 @@ func New(ctx context.Context, addr, database, user, password string) (*Client, e
 		return nil, fmt.Errorf("ping clickhouse: %w", err)
 	}
 	return &Client{Conn: conn}, nil
+}
+
+func options(addr, database, user, password string) *clickhouse.Options {
+	return &clickhouse.Options{
+		Addr:        []string{addr},
+		Auth:        clickhouse.Auth{Database: database, Username: user, Password: password},
+		Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
+		DialTimeout: 5 * time.Second,
+	}
 }
