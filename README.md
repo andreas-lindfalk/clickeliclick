@@ -27,6 +27,7 @@ curl -X POST localhost:8080/events -d '[{"user_id":1,"event_type":"click","paylo
 curl -X POST localhost:8080/event -d '{"user_id":1,"event_type":"click","payload":"{}"}'   # single row, async insert
 curl localhost:8080/events
 curl localhost:8080/users/42/events
+curl "localhost:8080/pages?ref=google"                      # groups on a JSON path
 curl localhost:8080/stats                                   # aggregates the raw table
 curl "localhost:8080/stats/minutes?from=2026-09-01T00:00:00Z&to=2026-09-01T01:00:00Z"   # reads the rollup
 ```
@@ -203,6 +204,52 @@ SELECT minute, events, users FROM events_per_minute LIMIT 1 FORMAT Vertical;
 -- what the states cost on disk
 SELECT name, formatReadableSize(data_compressed_bytes) FROM system.columns
 WHERE database = 'poc' AND table = 'events_per_minute';
+```
+
+## The JSON type
+
+Migration 004 turns `payload` from `String` into `JSON(page String, ref LowCardinality(String))`.
+ClickHouse stores every JSON path as its own column, so `WHERE payload.ref = 'google'` reads the
+`ref` subcolumn and nothing else. The Go side keeps sending and receiving JSON text: the connection
+sets `output_format_native_write_json_as_string` so the driver hands back a string, and the
+`Event.Payload` field is a `json.RawMessage`.
+
+Two kinds of paths:
+
+- **Typed paths** are the ones named in the column definition. They are ordinary columns: fast to
+  filter and group on, and present in *every* document, defaulting to `""` when the row was
+  written without them. Expect `{"page":"","ref":""}` on old rows.
+- **Dynamic paths** are everything else. Their type is inferred per value and they are queried with
+  an explicit type, `payload.experiment.variant.:Int64`. Grouping directly on one is refused
+  because its type may vary. After `max_dynamic_paths` distinct paths (default 1024), rare ones are
+  packed into a shared column and get slower.
+
+Measured on the 5M seeded rows, converting the column took 2.6 s and shrank it from 74 to
+58 MiB. Top pages for one referrer:
+
+| approach | rows read | bytes | time |
+|---|---|---|---|
+| `JSONExtractString(payload, 'page')` on a String column | 5.0M | 143 MiB | 163 ms |
+| `payload.page` on the JSON column | 5.0M | 76 MiB | 20 ms |
+
+Try it yourself:
+
+```sql
+-- every path the data contains, and the types seen for it
+SELECT arrayJoin(distinctJSONPathsAndTypes(payload)) FROM events;
+
+-- insert a document with keys nobody declared, then query them
+INSERT INTO events (user_id, event_type, payload)
+VALUES (1, 'click', '{"page":"/x","ref":"direct","experiment":{"name":"blue","variant":2}}');
+SELECT payload.experiment.name, payload.experiment.variant.:Int64 FROM events
+WHERE payload.experiment.variant.:Int64 = 2;
+
+-- how the column is laid out on disk: one substream per path
+SELECT substreams FROM system.parts_columns
+WHERE database = 'poc' AND table = 'events' AND column = 'payload' AND active LIMIT 1 FORMAT Vertical;
+
+-- the raw column vs a typed subcolumn in EXPLAIN
+EXPLAIN header = 1 SELECT payload.ref, count() FROM events GROUP BY 1;
 ```
 
 ## Tests

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -9,7 +10,8 @@ type Event struct {
 	TS        time.Time `json:"ts"`
 	UserID    uint64    `json:"user_id"`
 	EventType string    `json:"event_type"`
-	Payload   string    `json:"payload"`
+	// Payload is stored in a ClickHouse JSON column; see migration 004.
+	Payload json.RawMessage `json:"payload"`
 }
 
 // EventColumns holds a batch of events column by column, which is how
@@ -28,4 +30,10 @@ type MinuteStats struct {
 	EventType string    `json:"event_type"`
 	Events    uint64    `json:"events"`
 	Users     uint64    `json:"users"`
+}
+
+// PageCount is one row of TopPagesByRef.
+type PageCount struct {
+	Page  string `json:"page"`
+	Count uint64 `json:"count"`
 }

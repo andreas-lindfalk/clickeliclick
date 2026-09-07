@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"testing"
@@ -40,9 +41,9 @@ func TestInsertAndRecentEvents(t *testing.T) {
 
 	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	in := []Event{
-		{TS: base, UserID: 1, EventType: "click", Payload: `{"a":1}`},
-		{TS: base.Add(time.Second), UserID: 2, EventType: "view", Payload: `{}`},
-		{TS: base.Add(2 * time.Second), UserID: 1, EventType: "click", Payload: `{"a":2}`},
+		{TS: base, UserID: 1, EventType: "click", Payload: json.RawMessage(`{"a":1}`)},
+		{TS: base.Add(time.Second), UserID: 2, EventType: "view", Payload: json.RawMessage(`{}`)},
+		{TS: base.Add(2 * time.Second), UserID: 1, EventType: "click", Payload: json.RawMessage(`{"a":2}`)},
 	}
 	require.NoError(t, repo.InsertEvents(ctx, in))
 
@@ -50,10 +51,11 @@ func TestInsertAndRecentEvents(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 3)
 
-	// RecentEvents orders by ts DESC.
-	require.Equal(t, in[2].Payload, got[0].Payload)
-	require.Equal(t, in[1].Payload, got[1].Payload)
-	require.Equal(t, in[0].Payload, got[2].Payload)
+	// RecentEvents orders by ts DESC. The typed paths page and ref (migration
+	// 004) exist on every document, defaulting to "", even when never written.
+	require.JSONEq(t, `{"a":2,"page":"","ref":""}`, string(got[0].Payload))
+	require.JSONEq(t, `{"page":"","ref":""}`, string(got[1].Payload))
+	require.JSONEq(t, `{"a":1,"page":"","ref":""}`, string(got[2].Payload))
 	require.True(t, got[0].TS.Equal(in[2].TS), "ts round-trips through DateTime64(3)")
 }
 
@@ -93,16 +95,16 @@ func TestRecentEventsByUser(t *testing.T) {
 
 	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	require.NoError(t, repo.InsertEvents(ctx, []Event{
-		{TS: base, UserID: 1, EventType: "view", Payload: "first"},
-		{TS: base.Add(time.Second), UserID: 2, EventType: "view", Payload: "other user"},
-		{TS: base.Add(2 * time.Second), UserID: 1, EventType: "click", Payload: "second"},
+		{TS: base, UserID: 1, EventType: "view", Payload: json.RawMessage(`{"n":"first"}`)},
+		{TS: base.Add(time.Second), UserID: 2, EventType: "view", Payload: json.RawMessage(`{"n":"other user"}`)},
+		{TS: base.Add(2 * time.Second), UserID: 1, EventType: "click", Payload: json.RawMessage(`{"n":"second"}`)},
 	}))
 
 	got, err := repo.RecentEventsByUser(ctx, 1, 10)
 	require.NoError(t, err)
 	require.Len(t, got, 2)
-	require.Equal(t, "second", got[0].Payload)
-	require.Equal(t, "first", got[1].Payload)
+	require.JSONEq(t, `{"n":"second","page":"","ref":""}`, string(got[0].Payload))
+	require.JSONEq(t, `{"n":"first","page":"","ref":""}`, string(got[1].Payload))
 	for _, e := range got {
 		require.Equal(t, uint64(1), e.UserID)
 	}
@@ -137,14 +139,14 @@ func TestInsertEventAsync(t *testing.T) {
 	repo := NewRepository(testServer.NewClient(t))
 	ctx := context.Background()
 
-	require.NoError(t, repo.InsertEventAsync(ctx, Event{UserID: 7, EventType: "click", Payload: `{"async":true}`}))
+	require.NoError(t, repo.InsertEventAsync(ctx, Event{UserID: 7, EventType: "click", Payload: json.RawMessage(`{"async":true}`)}))
 
 	// wait=true means the async buffer has been flushed, so the row is visible.
 	got, err := repo.RecentEvents(ctx, 1)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, uint64(7), got[0].UserID)
-	require.Equal(t, `{"async":true}`, got[0].Payload)
+	require.JSONEq(t, `{"async":true,"page":"","ref":""}`, string(got[0].Payload))
 }
 
 func TestCountByType(t *testing.T) {
@@ -208,4 +210,38 @@ func TestStatsPerMinuteMergesAcrossInserts(t *testing.T) {
 	got, err := repo.StatsPerMinute(ctx, m0, m0.Add(time.Minute))
 	require.NoError(t, err)
 	require.Equal(t, []MinuteStats{{Minute: m0, EventType: "view", Events: 3, Users: 2}}, got)
+}
+
+// A nested document with keys the schema has never seen round-trips intact:
+// the typed paths (page, ref) and the dynamic ones are reassembled on read.
+// Key order is not preserved, JSONEq does not care.
+func TestPayloadRoundTrip(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	doc := `{"page":"/checkout","ref":"google","experiment":{"name":"blue-button","variant":2},"tags":["a","b"],"price":9.5}`
+	require.NoError(t, repo.InsertEvents(ctx, []Event{{UserID: 1, EventType: "view", Payload: json.RawMessage(doc)}}))
+
+	got, err := repo.RecentEvents(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.JSONEq(t, doc, string(got[0].Payload))
+}
+
+func TestTopPagesByRef(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	ev := func(ref, page string) Event {
+		return Event{UserID: 1, EventType: "view", Payload: json.RawMessage(`{"page":"` + page + `","ref":"` + ref + `"}`)}
+	}
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		ev("google", "/a"), ev("google", "/a"), ev("google", "/b"),
+		ev("direct", "/a"), ev("direct", "/c"),
+		{UserID: 2, EventType: "view"}, // no payload at all
+	}))
+
+	got, err := repo.TopPagesByRef(ctx, "google", 10)
+	require.NoError(t, err)
+	require.Equal(t, []PageCount{{Page: "/a", Count: 2}, {Page: "/b", Count: 1}}, got)
 }

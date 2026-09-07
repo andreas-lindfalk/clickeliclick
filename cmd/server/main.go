@@ -92,6 +92,21 @@ func main() {
 		writeJSON(w, events)
 	})
 
+	// GET /pages?ref=google — top pages for one referrer, grouped on a JSON path.
+	mux.HandleFunc("GET /pages", func(w http.ResponseWriter, r *http.Request) {
+		ref := r.URL.Query().Get("ref")
+		if ref == "" {
+			http.Error(w, "ref is required", http.StatusBadRequest)
+			return
+		}
+		pages, err := repo.TopPagesByRef(r.Context(), ref, 10)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, pages)
+	})
+
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		counts, err := repo.CountByType(r.Context())
 		if err != nil {

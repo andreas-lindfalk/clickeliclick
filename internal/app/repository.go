@@ -2,12 +2,14 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"clickeliclick/internal/pkg/clickhouse"
 
 	cl "github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
 type Repository struct {
@@ -30,7 +32,7 @@ func (r *Repository) InsertEvents(ctx context.Context, events []Event) error {
 		if ts.IsZero() {
 			ts = time.Now()
 		}
-		if err := batch.Append(ts, e.UserID, e.EventType, e.Payload); err != nil {
+		if err := batch.Append(ts, e.UserID, e.EventType, payloadOrEmpty(e.Payload)); err != nil {
 			return fmt.Errorf("append row: %w", err)
 		}
 	}
@@ -67,8 +69,35 @@ func (r *Repository) InsertEventAsync(ctx context.Context, e Event) error {
 	ctx = cl.Context(ctx, cl.WithAsync(true))
 	return r.client.Exec(ctx,
 		"INSERT INTO events (ts, user_id, event_type, payload) VALUES (?, ?, ?, ?)",
-		ts, e.UserID, e.EventType, e.Payload,
+		ts, e.UserID, e.EventType, payloadOrEmpty(e.Payload),
 	)
+}
+
+// payloadOrEmpty returns the payload as the JSON text ClickHouse parses on
+// insert, substituting an empty object for a missing one.
+func payloadOrEmpty(p json.RawMessage) string {
+	if len(p) == 0 {
+		return "{}"
+	}
+	return string(p)
+}
+
+// scanEvents drains a result set of (ts, user_id, event_type, payload) rows.
+// The JSON column arrives as text thanks to the connection setting
+// output_format_native_write_json_as_string.
+func scanEvents(rows driver.Rows) ([]Event, error) {
+	defer rows.Close()
+	out := []Event{}
+	for rows.Next() {
+		var e Event
+		var payload string
+		if err := rows.Scan(&e.TS, &e.UserID, &e.EventType, &payload); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		e.Payload = json.RawMessage(payload)
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // RecentEvents returns the latest n rows.
@@ -80,17 +109,7 @@ func (r *Repository) RecentEvents(ctx context.Context, n int) ([]Event, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query events: %w", err)
 	}
-	defer rows.Close()
-
-	out := []Event{}
-	for rows.Next() {
-		var e Event
-		if err := rows.Scan(&e.TS, &e.UserID, &e.EventType, &e.Payload); err != nil {
-			return nil, fmt.Errorf("scan row: %w", err)
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
+	return scanEvents(rows)
 }
 
 // RecentEventsByUser returns the latest n rows for one user. Served from the
@@ -104,15 +123,33 @@ func (r *Repository) RecentEventsByUser(ctx context.Context, userID uint64, n in
 	if err != nil {
 		return nil, fmt.Errorf("query events by user: %w", err)
 	}
+	return scanEvents(rows)
+}
+
+// TopPagesByRef groups on a JSON path. payload.page and payload.ref are typed
+// paths (see migration 004) so they behave like ordinary columns: only those
+// two subcolumns are read, the rest of the document is never touched.
+func (r *Repository) TopPagesByRef(ctx context.Context, ref string, n int) ([]PageCount, error) {
+	rows, err := r.client.Query(ctx, `
+		SELECT payload.page AS page, count() AS c
+		FROM events
+		WHERE payload.ref = {ref:String}
+		GROUP BY page ORDER BY c DESC, page LIMIT {n:UInt32}`,
+		cl.Named("ref", ref),
+		cl.Named("n", uint32(n)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query top pages: %w", err)
+	}
 	defer rows.Close()
 
-	out := []Event{}
+	out := []PageCount{}
 	for rows.Next() {
-		var e Event
-		if err := rows.Scan(&e.TS, &e.UserID, &e.EventType, &e.Payload); err != nil {
+		var p PageCount
+		if err := rows.Scan(&p.Page, &p.Count); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
-		out = append(out, e)
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }

@@ -32,5 +32,12 @@ func options(cfg Config) *clickhouse.Options {
 		Auth:        clickhouse.Auth{Database: cfg.Database, Username: cfg.User, Password: cfg.Password},
 		Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
 		DialTimeout: 5 * time.Second,
+		Settings: clickhouse.Settings{
+			// Hand JSON columns to the client as JSON text rather than the
+			// driver's structured JSON object, so we can scan into a string.
+			"output_format_native_write_json_as_string": 1,
+			// ClickHouse escapes "/" as "\/" in JSON output by default.
+			"output_format_json_escape_forward_slashes": 0,
+		},
 	}
 }
