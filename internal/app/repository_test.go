@@ -87,6 +87,45 @@ func TestInsertDefaultsTimestamp(t *testing.T) {
 	require.True(t, got[0].TS.After(before), "zero TS should be filled with now()")
 }
 
+func TestInsertEventColumns(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	const n = 10_000
+	cols := EventColumns{
+		TS:        make([]time.Time, n),
+		UserID:    make([]uint64, n),
+		EventType: make([]string, n),
+		Payload:   make([]string, n),
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i := range n {
+		cols.TS[i] = base.Add(time.Duration(i) * time.Millisecond)
+		cols.UserID[i] = uint64(i % 100)
+		cols.EventType[i] = "view"
+		cols.Payload[i] = "{}"
+	}
+	require.NoError(t, repo.InsertEventColumns(ctx, cols))
+
+	counts, err := repo.CountByType(ctx)
+	require.NoError(t, err)
+	require.Equal(t, map[string]uint64{"view": n}, counts)
+}
+
+func TestInsertEventAsync(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	require.NoError(t, repo.InsertEventAsync(ctx, Event{UserID: 7, EventType: "click", Payload: `{"async":true}`}))
+
+	// wait=true means the async buffer has been flushed, so the row is visible.
+	got, err := repo.RecentEvents(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(7), got[0].UserID)
+	require.Equal(t, `{"async":true}`, got[0].Payload)
+}
+
 func TestCountByType(t *testing.T) {
 	repo := NewRepository(testServer.NewClient(t))
 

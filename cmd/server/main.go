@@ -19,16 +19,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	addr := env("CLICKHOUSE_ADDR", "localhost:9000")
-	database := env("CLICKHOUSE_DB", "poc")
-	user := env("CLICKHOUSE_USER", "default")
-	password := env("CLICKHOUSE_PASSWORD", "")
-
-	if err := clickhouse.Migrate(ctx, addr, database, user, password); err != nil {
+	cfg := clickhouse.ConfigFromEnv()
+	if err := clickhouse.Migrate(ctx, cfg); err != nil {
 		log.Fatal(err)
 	}
 
-	ch, err := clickhouse.New(ctx, addr, database, user, password)
+	ch, err := clickhouse.New(ctx, cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -57,6 +53,21 @@ func main() {
 		w.WriteHeader(http.StatusAccepted)
 	})
 
+	// POST /event with a single JSON event. Each request is its own INSERT;
+	// ClickHouse buffers them server-side (async_insert) and flushes one part.
+	mux.HandleFunc("POST /event", func(w http.ResponseWriter, r *http.Request) {
+		var e app.Event
+		if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := repo.InsertEventAsync(r.Context(), e); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
+
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 		events, err := repo.RecentEvents(r.Context(), 50)
 		if err != nil {
@@ -75,7 +86,11 @@ func main() {
 		writeJSON(w, counts)
 	})
 
-	srv := &http.Server{Addr: env("HTTP_ADDR", ":8080"), Handler: mux}
+	httpAddr := os.Getenv("HTTP_ADDR")
+	if httpAddr == "" {
+		httpAddr = ":8080"
+	}
+	srv := &http.Server{Addr: httpAddr, Handler: mux}
 
 	go func() {
 		log.Printf("listening on %s", srv.Addr)
@@ -88,13 +103,6 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
-}
-
-func env(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

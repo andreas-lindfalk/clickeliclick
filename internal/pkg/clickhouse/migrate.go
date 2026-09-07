@@ -16,8 +16,8 @@ import (
 //
 // goose works over database/sql, while the Client uses the native driver
 // interface, so this opens its own short-lived connection.
-func Migrate(ctx context.Context, addr, database, user, password string) error {
-	db := clickhouse.OpenDB(options(addr, database, user, password))
+func Migrate(ctx context.Context, cfg Config) error {
+	db := clickhouse.OpenDB(options(cfg))
 	defer db.Close()
 
 	p, err := goose.NewProvider(goose.DialectClickHouse, db, migrations.FS)

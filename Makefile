@@ -17,3 +17,6 @@ sql:       ## open an interactive clickhouse-client
 
 test:      ## run integration tests (needs Docker)
 	go test ./... -v -count=1
+
+seed:      ## load synthetic events (ROWS=..., BATCH=... to override)
+	go run ./cmd/seed -rows $(or $(ROWS),5000000) -batch $(or $(BATCH),500000)

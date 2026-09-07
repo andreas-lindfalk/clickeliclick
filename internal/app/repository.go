@@ -37,6 +37,40 @@ func (r *Repository) InsertEvents(ctx context.Context, events []Event) error {
 	return batch.Send()
 }
 
+// InsertEventColumns sends a whole batch with one Append per column instead of
+// one per row. For bulk loads this avoids per-row reflection in the driver and
+// is the fastest path into ClickHouse.
+func (r *Repository) InsertEventColumns(ctx context.Context, cols EventColumns) error {
+	batch, err := r.client.PrepareBatch(ctx, "INSERT INTO events (ts, user_id, event_type, payload)")
+	if err != nil {
+		return fmt.Errorf("prepare batch: %w", err)
+	}
+	for i, col := range []any{cols.TS, cols.UserID, cols.EventType, cols.Payload} {
+		if err := batch.Column(i).Append(col); err != nil {
+			return fmt.Errorf("append column %d: %w", i, err)
+		}
+	}
+	return batch.Send()
+}
+
+// InsertEventAsync writes a single row using ClickHouse's server-side async
+// inserts: the server buffers rows from many small inserts and flushes them as
+// one part, so callers do not have to batch themselves. The async mode is
+// attached to the context and turns into the async_insert setting on the wire.
+// With wait=true the call returns only once the buffer has been flushed to a
+// part, so a subsequent SELECT will see the row.
+func (r *Repository) InsertEventAsync(ctx context.Context, e Event) error {
+	ts := e.TS
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	ctx = cl.Context(ctx, cl.WithAsync(true))
+	return r.client.Exec(ctx,
+		"INSERT INTO events (ts, user_id, event_type, payload) VALUES (?, ?, ?, ?)",
+		ts, e.UserID, e.EventType, e.Payload,
+	)
+}
+
 // RecentEvents returns the latest n rows.
 func (r *Repository) RecentEvents(ctx context.Context, n int) ([]Event, error) {
 	rows, err := r.client.Query(ctx,

@@ -16,27 +16,23 @@ import (
 	"clickeliclick/internal/pkg/clickhouse"
 )
 
-const (
-	image    = "clickhouse/clickhouse-server:26.8"
-	database = "poc"
-	user     = "default"
-	password = "test"
-)
+const image = "clickhouse/clickhouse-server:26.8"
+
+// cfg is completed with the container's address once it is running.
+var cfg = clickhouse.Config{Database: "poc", User: "default", Password: "test"}
 
 // Server is a ClickHouse container with the project migrations applied.
 type Server struct {
 	Container *tcclickhouse.ClickHouseContainer
-
-	// addr is the host:port of the container's native interface.
-	addr string
+	cfg       clickhouse.Config
 }
 
 // Start runs the container and waits until it accepts connections.
 func Start(ctx context.Context) (*Server, error) {
 	ctr, err := tcclickhouse.Run(ctx, image,
-		tcclickhouse.WithDatabase(database),
-		tcclickhouse.WithUsername(user),
-		tcclickhouse.WithPassword(password),
+		tcclickhouse.WithDatabase(cfg.Database),
+		tcclickhouse.WithUsername(cfg.User),
+		tcclickhouse.WithPassword(cfg.Password),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("run clickhouse container: %w", err)
@@ -50,11 +46,13 @@ func Start(ctx context.Context) (*Server, error) {
 		)
 	}
 
-	if err := clickhouse.Migrate(ctx, addr, database, user, password); err != nil {
+	c := cfg
+	c.Addr = addr
+	if err := clickhouse.Migrate(ctx, c); err != nil {
 		return nil, errors.Join(err, testcontainers.TerminateContainer(ctr))
 	}
 
-	return &Server{Container: ctr, addr: addr}, nil
+	return &Server{Container: ctr, cfg: c}, nil
 }
 
 // NewClient connects to the server and truncates the events table so each
@@ -63,7 +61,7 @@ func (s *Server) NewClient(t *testing.T) *clickhouse.Client {
 	t.Helper()
 	ctx := context.Background()
 
-	c, err := clickhouse.New(ctx, s.addr, database, user, password)
+	c, err := clickhouse.New(ctx, s.cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, c.Close()) })
 
