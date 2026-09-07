@@ -37,3 +37,17 @@ type PageCount struct {
 	Page  string `json:"page"`
 	Count uint64 `json:"count"`
 }
+
+// User is a row of the users dimension table (ReplacingMergeTree, migration 006).
+type User struct {
+	UserID    uint64    `json:"user_id"`
+	Country   string    `json:"country"`
+	Plan      string    `json:"plan"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// CountryCount is one row of EventsByCountry.
+type CountryCount struct {
+	Country string `json:"country"`
+	Events  uint64 `json:"events"`
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -105,6 +106,57 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	mux.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid user id", http.StatusBadRequest)
+			return
+		}
+		u, err := repo.GetUser(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		writeJSON(w, u)
+	})
+
+	// PUT /users/{id} with {"country":"SE","plan":"pro"} inserts a new version
+	// of the user; ReplacingMergeTree keeps the newest at merge time.
+	mux.HandleFunc("PUT /users/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid user id", http.StatusBadRequest)
+			return
+		}
+		var u app.User
+		if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		u.UserID = id
+		if err := repo.UpsertUsers(r.Context(), []app.User{u}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// GET /stats/countries?from=RFC3339&to=RFC3339, defaulting to the last day.
+	// Enriches events with the user's country through the users_dict dictionary.
+	mux.HandleFunc("GET /stats/countries", func(w http.ResponseWriter, r *http.Request) {
+		from, to, err := timeWindow(r, 24*time.Hour)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		counts, err := repo.EventsByCountry(r.Context(), from, to)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, counts)
+	})
+
 	// GET /pages?ref=google — top pages for one referrer, grouped on a JSON path.
 	mux.HandleFunc("GET /pages", func(w http.ResponseWriter, r *http.Request) {
 		ref := r.URL.Query().Get("ref")
@@ -136,19 +188,10 @@ func main() {
 	// GET /stats/minutes?from=RFC3339&to=RFC3339, defaulting to the last hour.
 	// Served from the events_per_minute rollup, not the raw table.
 	mux.HandleFunc("GET /stats/minutes", func(w http.ResponseWriter, r *http.Request) {
-		to, from := time.Now(), time.Now().Add(-time.Hour)
-		var err error
-		if v := r.URL.Query().Get("from"); v != "" {
-			if from, err = time.Parse(time.RFC3339, v); err != nil {
-				http.Error(w, "from: "+err.Error(), http.StatusBadRequest)
-				return
-			}
-		}
-		if v := r.URL.Query().Get("to"); v != "" {
-			if to, err = time.Parse(time.RFC3339, v); err != nil {
-				http.Error(w, "to: "+err.Error(), http.StatusBadRequest)
-				return
-			}
+		from, to, err := timeWindow(r, time.Hour)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
 		stats, err := repo.StatsPerMinute(r.Context(), from, to)
 		if err != nil {
@@ -176,4 +219,21 @@ func main() {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// timeWindow reads optional RFC3339 from/to query parameters, defaulting to
+// the last span ending now.
+func timeWindow(r *http.Request, span time.Duration) (from, to time.Time, err error) {
+	to, from = time.Now(), time.Now().Add(-span)
+	if v := r.URL.Query().Get("from"); v != "" {
+		if from, err = time.Parse(time.RFC3339, v); err != nil {
+			return from, to, fmt.Errorf("from: %w", err)
+		}
+	}
+	if v := r.URL.Query().Get("to"); v != "" {
+		if to, err = time.Parse(time.RFC3339, v); err != nil {
+			return from, to, fmt.Errorf("to: %w", err)
+		}
+	}
+	return from, to, nil
 }

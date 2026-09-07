@@ -18,8 +18,13 @@ import (
 
 const image = "clickhouse/clickhouse-server:26.8"
 
-// cfg is completed with the container's address once it is running.
-var cfg = clickhouse.Config{Database: "poc", User: "default", Password: "test"}
+// cfg is completed with the container's address once it is running. The
+// default user has no password, as in docker-compose.yml. The image only
+// allows that when CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT is set; otherwise it
+// disables network access for a passwordless default user. A passwordless
+// default user also lets the users_dict dictionary (migration 006) read its
+// source table without credentials in the migration.
+var cfg = clickhouse.Config{Database: "poc", User: "default", Password: ""}
 
 // Server is a ClickHouse container with the project migrations applied.
 type Server struct {
@@ -33,6 +38,7 @@ func Start(ctx context.Context) (*Server, error) {
 		tcclickhouse.WithDatabase(cfg.Database),
 		tcclickhouse.WithUsername(cfg.User),
 		tcclickhouse.WithPassword(cfg.Password),
+		testcontainers.WithEnv(map[string]string{"CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT": "1"}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("run clickhouse container: %w", err)
@@ -79,6 +85,8 @@ func (s *Server) NewClient(t *testing.T) *clickhouse.Client {
 	for _, name := range tables {
 		require.NoError(t, c.Exec(ctx, "TRUNCATE TABLE "+name))
 	}
+	// Dictionaries cache their source; drop what the previous test loaded.
+	require.NoError(t, c.Exec(ctx, "SYSTEM RELOAD DICTIONARIES"))
 	return c
 }
 

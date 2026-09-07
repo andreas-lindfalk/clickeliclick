@@ -29,6 +29,9 @@ curl localhost:8080/events
 curl localhost:8080/users/42/events
 curl "localhost:8080/pages?ref=google"                      # groups on a JSON path
 curl -X DELETE localhost:8080/users/42/events               # erasure request: a mutation
+curl -X PUT localhost:8080/users/7 -d '{"country":"IS","plan":"team"}'   # "update": insert a new version
+curl localhost:8080/users/7                                 # read with FINAL
+curl "localhost:8080/stats/countries"                       # dictGet lookup per event
 curl localhost:8080/stats                                   # aggregates the raw table
 curl "localhost:8080/stats/minutes?from=2026-09-01T00:00:00Z&to=2026-09-01T01:00:00Z"   # reads the rollup
 ```
@@ -305,6 +308,55 @@ FROM system.parts WHERE table = 'events' AND active GROUP BY partition;
 -- the drift between raw and rollup after a delete
 SELECT (SELECT count() FROM events) AS raw,
        (SELECT sum(c) FROM (SELECT countMerge(events) AS c FROM events_per_minute GROUP BY minute, event_type)) AS rollup;
+```
+
+## Updates and lookups: ReplacingMergeTree and dictionaries
+
+Parts are immutable, so ClickHouse has no in-place update. Migration 006 adds a `users` table on
+`ReplacingMergeTree(updated_at)`: an update is an insert of a new version, and the engine keeps only
+the newest version per `user_id` when parts merge. Until they merge, both versions are on disk, and
+the read side has to cope, the same pattern as the rollup in the materialized-view section:
+
+- `SELECT ... FROM users FINAL` applies the merge rule at read time. Correct, simple, and it has to
+  read every version of every matching key. `Repository.GetUser` uses it for point lookups.
+- `argMax(country, updated_at) ... GROUP BY user_id` does the same by hand and can be cheaper for
+  scans, since it is an ordinary aggregation.
+- Waiting for merges is not an option: nothing guarantees when, or that, the last merge happens.
+
+`users_dict` is a **dictionary**, an in-memory hash table refreshed from the `users` table every
+30 to 60 seconds, or on `SYSTEM RELOAD DICTIONARY users_dict`. Its source query uses `FINAL`, so it
+loads one version per key. `dictGet('users_dict', 'country', user_id)` is a hash lookup per row,
+which is how `Repository.EventsByCountry` enriches five million events without a join. It is a
+snapshot, so an updated user is served stale until the next reload; the test for it shows exactly that.
+
+Measured on the seeded data, 100k users and 5M events:
+
+| query | rows read | time | memory |
+|---|---|---|---|
+| events per country via `dictGet` | 5.0M | 26 ms | 4.4 MiB |
+| events per country via `JOIN users FINAL` | 5.1M | 57 ms | 22.6 MiB |
+| `count() FROM users` | 1 | 1 ms | |
+| `count() FROM users FINAL` | 108k | 3 ms | |
+
+The dictionary holds 100k users in 13 MiB and loads in under 30 ms. Dictionaries suit dimension
+data that fits in memory and changes slowly; a join is the tool when neither holds.
+
+Try it yourself:
+
+```sql
+-- both versions of an updated user are on disk until a merge
+SELECT user_id, country, plan, updated_at, _part FROM users WHERE user_id = 7;
+SELECT user_id, country, plan FROM users FINAL WHERE user_id = 7;
+OPTIMIZE TABLE users FINAL;   -- now the first query returns one row too
+
+-- what the dictionary looks like from the inside
+SELECT name, status, element_count, formatReadableSize(bytes_allocated) AS memory,
+       loading_duration, last_successful_update_time FROM system.dictionaries;
+
+-- the same lookup, three ways
+SELECT dictGet('users_dict', 'country', toUInt64(7));
+SELECT country FROM users FINAL WHERE user_id = 7;
+SELECT argMax(country, updated_at) FROM users WHERE user_id = 7;
 ```
 
 ## Tests

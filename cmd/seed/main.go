@@ -19,7 +19,11 @@ import (
 	"clickeliclick/internal/pkg/clickhouse"
 )
 
-var eventTypes = []string{"view", "view", "view", "view", "view", "view", "click", "click", "click", "purchase"}
+var (
+	eventTypes = []string{"view", "view", "view", "view", "view", "view", "click", "click", "click", "purchase"}
+	countries  = []string{"SE", "SE", "SE", "NO", "DK", "FI", "DE", "DE", "US", "US"}
+	plans      = []string{"free", "free", "free", "pro", "team"}
+)
 
 func main() {
 	rows := flag.Int("rows", 5_000_000, "total rows to insert")
@@ -47,6 +51,20 @@ func main() {
 	span := end.Sub(start)
 
 	t0 := time.Now()
+
+	// One users row per id, so events have something to look up.
+	us := make([]app.User, 0, *users)
+	for id := 1; id <= *users; id++ {
+		us = append(us, app.User{UserID: uint64(id), Country: countries[rng.IntN(len(countries))], Plan: plans[rng.IntN(len(plans))]})
+	}
+	if err := repo.UpsertUsers(ctx, us); err != nil {
+		log.Fatal(err)
+	}
+	if err := repo.ReloadUserLookup(ctx); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("upserted %d users", len(us))
+
 	for done := 0; done < *rows; {
 		n := min(*batch, *rows-done)
 		cols := app.EventColumns{

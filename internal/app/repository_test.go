@@ -306,3 +306,53 @@ func TestTTLDropsExpiredRowsOnInsert(t *testing.T) {
 	require.Len(t, got, 1)
 	require.Equal(t, uint64(2), got[0].UserID)
 }
+
+func TestUpsertUserKeepsNewestVersion(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	t0 := recentMinute()
+	require.NoError(t, repo.UpsertUsers(ctx, []User{{UserID: 1, Country: "SE", Plan: "free", UpdatedAt: t0}}))
+	require.NoError(t, repo.UpsertUsers(ctx, []User{{UserID: 1, Country: "NO", Plan: "pro", UpdatedAt: t0.Add(time.Second)}}))
+
+	// Two inserts, two parts, two versions on disk. FINAL picks the newest.
+	got, err := repo.GetUser(ctx, 1)
+	require.NoError(t, err)
+	require.Equal(t, "NO", got.Country)
+	require.Equal(t, "pro", got.Plan)
+	require.True(t, got.UpdatedAt.Equal(t0.Add(time.Second)))
+}
+
+func TestEventsByCountryUsesDictionary(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	m0 := recentMinute()
+	require.NoError(t, repo.UpsertUsers(ctx, []User{
+		{UserID: 1, Country: "SE", Plan: "free"},
+		{UserID: 2, Country: "SE", Plan: "pro"},
+		{UserID: 3, Country: "DE", Plan: "free"},
+	}))
+	require.NoError(t, repo.ReloadUserLookup(ctx))
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		{TS: m0, UserID: 1, EventType: "view"},
+		{TS: m0, UserID: 2, EventType: "view"},
+		{TS: m0, UserID: 3, EventType: "view"},
+		{TS: m0, UserID: 99, EventType: "view"}, // no such user
+	}))
+
+	got, err := repo.EventsByCountry(ctx, m0, m0.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []CountryCount{{Country: "SE", Events: 2}, {Country: "", Events: 1}, {Country: "DE", Events: 1}}, got)
+
+	// The dictionary is a snapshot: an update is invisible until it reloads.
+	require.NoError(t, repo.UpsertUsers(ctx, []User{{UserID: 3, Country: "SE", Plan: "free"}}))
+	got, err = repo.EventsByCountry(ctx, m0, m0.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), got[0].Events, "stale until reload")
+
+	require.NoError(t, repo.ReloadUserLookup(ctx))
+	got, err = repo.EventsByCountry(ctx, m0, m0.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []CountryCount{{Country: "SE", Events: 3}, {Country: "", Events: 1}}, got)
+}

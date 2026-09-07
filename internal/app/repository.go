@@ -221,3 +221,74 @@ func (r *Repository) StatsPerMinute(ctx context.Context, from, to time.Time) ([]
 	}
 	return out, rows.Err()
 }
+
+// UpsertUsers writes one version per user. It is a plain insert; the
+// ReplacingMergeTree engine drops older versions of the same user_id when
+// parts merge, and reads use FINAL until then.
+func (r *Repository) UpsertUsers(ctx context.Context, users []User) error {
+	batch, err := r.client.PrepareBatch(ctx, "INSERT INTO users (user_id, country, plan, updated_at)")
+	if err != nil {
+		return fmt.Errorf("prepare batch: %w", err)
+	}
+	now := time.Now()
+	for _, u := range users {
+		ts := u.UpdatedAt
+		if ts.IsZero() {
+			ts = now
+		}
+		if err := batch.Append(u.UserID, u.Country, u.Plan, ts); err != nil {
+			return fmt.Errorf("append row: %w", err)
+		}
+	}
+	return batch.Send()
+}
+
+// GetUser returns the newest version of one user. FINAL makes ClickHouse
+// apply the engine's merge rule at read time, so this is correct even when
+// several versions are still in separate parts. It costs extra work for
+// every read, which is fine for a point lookup and expensive for a scan.
+func (r *Repository) GetUser(ctx context.Context, userID uint64) (*User, error) {
+	var u User
+	err := r.client.QueryRow(ctx,
+		"SELECT user_id, country, plan, updated_at FROM users FINAL WHERE user_id = {user_id:UInt64}",
+		cl.Named("user_id", userID),
+	).Scan(&u.UserID, &u.Country, &u.Plan, &u.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("query user: %w", err)
+	}
+	return &u, nil
+}
+
+// ReloadUserLookup forces the users_dict dictionary to reload from the users
+// table instead of waiting for its LIFETIME refresh.
+func (r *Repository) ReloadUserLookup(ctx context.Context) error {
+	return r.client.Exec(ctx, "SYSTEM RELOAD DICTIONARY users_dict")
+}
+
+// EventsByCountry counts events in [from, to) per user country. The country
+// comes from the users_dict dictionary via dictGet, a hash lookup per row,
+// rather than a JOIN. Users unknown to the dictionary count under "".
+func (r *Repository) EventsByCountry(ctx context.Context, from, to time.Time) ([]CountryCount, error) {
+	rows, err := r.client.Query(ctx, `
+		SELECT dictGet('users_dict', 'country', user_id) AS country, count() AS c
+		FROM events
+		WHERE ts >= {from:DateTime} AND ts < {to:DateTime}
+		GROUP BY country ORDER BY c DESC, country`,
+		cl.Named("from", from.UTC().Format(time.DateTime)),
+		cl.Named("to", to.UTC().Format(time.DateTime)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query events by country: %w", err)
+	}
+	defer rows.Close()
+
+	out := []CountryCount{}
+	for rows.Next() {
+		var c CountryCount
+		if err := rows.Scan(&c.Country, &c.Events); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
