@@ -92,6 +92,19 @@ func main() {
 		writeJSON(w, events)
 	})
 
+	mux.HandleFunc("DELETE /users/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid user id", http.StatusBadRequest)
+			return
+		}
+		if err := repo.DeleteUserEvents(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	// GET /pages?ref=google — top pages for one referrer, grouped on a JSON path.
 	mux.HandleFunc("GET /pages", func(w http.ResponseWriter, r *http.Request) {
 		ref := r.URL.Query().Get("ref")

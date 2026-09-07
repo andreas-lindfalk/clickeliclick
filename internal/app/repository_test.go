@@ -34,12 +34,18 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// recentMinute is a fixed point an hour ago. Test rows must be younger than
+// the 90 day TTL on events (migration 005) or they are dropped on insert.
+func recentMinute() time.Time {
+	return time.Now().UTC().Add(-time.Hour).Truncate(time.Minute)
+}
+
 func TestInsertAndRecentEvents(t *testing.T) {
 	repo := NewRepository(testServer.NewClient(t))
 
 	ctx := context.Background()
 
-	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	base := recentMinute()
 	in := []Event{
 		{TS: base, UserID: 1, EventType: "click", Payload: json.RawMessage(`{"a":1}`)},
 		{TS: base.Add(time.Second), UserID: 2, EventType: "view", Payload: json.RawMessage(`{}`)},
@@ -93,7 +99,7 @@ func TestRecentEventsByUser(t *testing.T) {
 	repo := NewRepository(testServer.NewClient(t))
 	ctx := context.Background()
 
-	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	base := recentMinute()
 	require.NoError(t, repo.InsertEvents(ctx, []Event{
 		{TS: base, UserID: 1, EventType: "view", Payload: json.RawMessage(`{"n":"first"}`)},
 		{TS: base.Add(time.Second), UserID: 2, EventType: "view", Payload: json.RawMessage(`{"n":"other user"}`)},
@@ -121,7 +127,7 @@ func TestInsertEventColumns(t *testing.T) {
 		EventType: make([]string, n),
 		Payload:   make([]string, n),
 	}
-	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	base := recentMinute()
 	for i := range n {
 		cols.TS[i] = base.Add(time.Duration(i) * time.Millisecond)
 		cols.UserID[i] = uint64(i % 100)
@@ -177,7 +183,7 @@ func TestStatsPerMinute(t *testing.T) {
 	repo := NewRepository(testServer.NewClient(t))
 	ctx := context.Background()
 
-	m0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	m0 := recentMinute()
 	m1 := m0.Add(time.Minute)
 	require.NoError(t, repo.InsertEvents(ctx, []Event{
 		{TS: m0, UserID: 1, EventType: "view"},
@@ -203,7 +209,7 @@ func TestStatsPerMinuteMergesAcrossInserts(t *testing.T) {
 	repo := NewRepository(testServer.NewClient(t))
 	ctx := context.Background()
 
-	m0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	m0 := recentMinute()
 	require.NoError(t, repo.InsertEvents(ctx, []Event{{TS: m0, UserID: 1, EventType: "view"}}))
 	require.NoError(t, repo.InsertEvents(ctx, []Event{{TS: m0, UserID: 1, EventType: "view"}, {TS: m0, UserID: 2, EventType: "view"}}))
 
@@ -244,4 +250,59 @@ func TestTopPagesByRef(t *testing.T) {
 	got, err := repo.TopPagesByRef(ctx, "google", 10)
 	require.NoError(t, err)
 	require.Equal(t, []PageCount{{Page: "/a", Count: 2}, {Page: "/b", Count: 1}}, got)
+}
+
+func TestDeleteUserEvents(t *testing.T) {
+	client := testServer.NewClient(t)
+	repo := NewRepository(client)
+	ctx := context.Background()
+
+	m0 := recentMinute()
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		{TS: m0, UserID: 1, EventType: "view"},
+		{TS: m0, UserID: 1, EventType: "click"},
+		{TS: m0, UserID: 2, EventType: "view"},
+	}))
+
+	require.NoError(t, repo.DeleteUserEvents(ctx, 1))
+
+	// Gone from every read path, including the projection-backed one.
+	got, err := repo.RecentEvents(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(2), got[0].UserID)
+	byUser, err := repo.RecentEventsByUser(ctx, 1, 10)
+	require.NoError(t, err)
+	require.Empty(t, byUser)
+
+	// Physically gone, not masked: the parts were rewritten.
+	var remaining uint64
+	require.NoError(t, client.QueryRow(ctx,
+		"SELECT count() FROM events WHERE user_id = 1 SETTINGS apply_deleted_mask = 0, optimize_use_projections = 0").Scan(&remaining))
+	require.Zero(t, remaining)
+
+	// The rollup was fed by the inserts and knows nothing about the delete.
+	stats, err := repo.StatsPerMinute(ctx, m0, m0.Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []MinuteStats{
+		{Minute: m0, EventType: "click", Events: 1, Users: 1},
+		{Minute: m0, EventType: "view", Events: 2, Users: 2},
+	}, stats)
+}
+
+// TTL is enforced whenever a part is written or merged. A row that is already
+// expired at insert time never lands at all.
+func TestTTLDropsExpiredRowsOnInsert(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		{TS: time.Now().Add(-100 * 24 * time.Hour), UserID: 1, EventType: "view"},
+		{TS: time.Now(), UserID: 2, EventType: "view"},
+	}))
+
+	got, err := repo.RecentEvents(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, uint64(2), got[0].UserID)
 }

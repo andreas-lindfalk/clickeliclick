@@ -154,6 +154,22 @@ func (r *Repository) TopPagesByRef(ctx context.Context, ref string, n int) ([]Pa
 	return out, rows.Err()
 }
 
+// DeleteUserEvents removes every event for one user, the shape of an erasure
+// request. It is a classic mutation: every part that contains the user is
+// rewritten without those rows, and the by_user projection is rebuilt with
+// it, so the data is physically gone when this returns. That is the right
+// tool for rare, must-be-thorough deletes. The lightweight DELETE FROM only
+// masks rows and is refused on this table (see migration 005).
+//
+// The events_per_minute rollup is not touched; a materialized view only ever
+// sees inserts.
+func (r *Repository) DeleteUserEvents(ctx context.Context, userID uint64) error {
+	return r.client.Exec(ctx,
+		"ALTER TABLE events DELETE WHERE user_id = {user_id:UInt64} SETTINGS mutations_sync = 1",
+		cl.Named("user_id", userID),
+	)
+}
+
 // CountByType is a small aggregation example.
 func (r *Repository) CountByType(ctx context.Context) (map[string]uint64, error) {
 	rows, err := r.client.Query(ctx, "SELECT event_type, count() FROM events GROUP BY event_type ORDER BY event_type")

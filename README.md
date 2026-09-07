@@ -28,6 +28,7 @@ curl -X POST localhost:8080/event -d '{"user_id":1,"event_type":"click","payload
 curl localhost:8080/events
 curl localhost:8080/users/42/events
 curl "localhost:8080/pages?ref=google"                      # groups on a JSON path
+curl -X DELETE localhost:8080/users/42/events               # erasure request: a mutation
 curl localhost:8080/stats                                   # aggregates the raw table
 curl "localhost:8080/stats/minutes?from=2026-09-01T00:00:00Z&to=2026-09-01T01:00:00Z"   # reads the rollup
 ```
@@ -250,6 +251,60 @@ WHERE database = 'poc' AND table = 'events' AND column = 'payload' AND active LI
 
 -- the raw column vs a typed subcolumn in EXPLAIN
 EXPLAIN header = 1 SELECT payload.ref, count() FROM events GROUP BY 1;
+```
+
+## Data lifecycle: TTL, partitions, deletes
+
+ClickHouse parts are immutable, so nothing is ever changed in place. Everything in this section is
+either "drop a whole part" (cheap) or "rewrite the part without some rows" (a *mutation*, expensive).
+
+**Retention.** Migration 005 adds `TTL ts + INTERVAL 90 DAY` to `events`. TTL is enforced when a
+part is written or merged, not on a timer: a row already expired at insert never lands, a row that
+expires later lingers until its part is merged, and TTL merges run at most every
+`merge_with_ttl_timeout` seconds (4h). With `ttl_only_drop_parts = 1` and monthly partitions, old
+data ages out by dropping whole parts. The rollup has no TTL: aggregates outlive raw rows.
+
+**Partitions.** `ALTER TABLE events DROP PARTITION '202608'` removes a month instantly, which is why
+the partition key should match how you delete, not how you query.
+
+**Row deletes.** `Repository.DeleteUserEvents` runs `ALTER TABLE events DELETE WHERE user_id = ?`, a
+classic mutation: every part containing the user is rewritten, the projection with it, and the data
+is physically gone when it returns. On the 5M seeded rows that took 1.3 s for 53 rows, because it
+touched all ten parts. Right for rare, must-be-thorough erasure requests; wrong for anything frequent.
+
+ClickHouse also has *lightweight* deletes, `DELETE FROM events WHERE ...`, which only write a
+`_row_exists` mask and let merges remove the rows later. This table refuses them on purpose. Its
+default `lightweight_mutation_projection_mode = 'throw'` blocks lightweight deletes because the
+`by_user` projection would keep serving the deleted rows. Verified here on 26.8: with `'rebuild'` the
+projection-backed query returned the deleted rows while the main table did not, and with `'drop'`
+the affected parts lose the projection and can no longer merge with parts that have it. Lightweight
+deletes and projections do not mix yet.
+
+**The rollup drifts.** A materialized view only sees inserts, so after an erasure `events_per_minute`
+still counts the deleted rows. Aggregates without identity are usually fine to keep; if not, rebuild
+the affected minutes from `events`.
+
+Try it yourself:
+
+```sql
+-- what mutations ran, and whether any is stuck (a failed one blocks those behind it)
+SELECT command, create_time, is_done, parts_to_do, latest_fail_reason
+FROM system.mutations WHERE table = 'events' ORDER BY create_time DESC LIMIT 5;
+
+-- the mutation version is the last number in each part name; it changes on every rewrite
+SELECT name, rows, modification_time FROM system.parts WHERE table = 'events' AND active;
+
+-- expired rows never land
+INSERT INTO events (ts, user_id, event_type, payload) VALUES (now() - INTERVAL 100 DAY, 1, 'view', '{}');
+SELECT count() FROM events WHERE ts < now() - INTERVAL 90 DAY;
+
+-- when is a partition due to expire entirely?
+SELECT partition, min(delete_ttl_info_min) AS first_expiry, max(delete_ttl_info_max) AS last_expiry
+FROM system.parts WHERE table = 'events' AND active GROUP BY partition;
+
+-- the drift between raw and rollup after a delete
+SELECT (SELECT count() FROM events) AS raw,
+       (SELECT sum(c) FROM (SELECT countMerge(events) AS c FROM events_per_minute GROUP BY minute, event_type)) AS rollup;
 ```
 
 ## Tests
