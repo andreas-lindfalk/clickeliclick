@@ -32,6 +32,9 @@ curl -X DELETE localhost:8080/users/42/events               # erasure request: a
 curl -X PUT localhost:8080/users/7 -d '{"country":"IS","plan":"team"}'   # "update": insert a new version
 curl localhost:8080/users/7                                 # read with FINAL
 curl "localhost:8080/stats/countries"                       # dictGet lookup per event
+curl "localhost:8080/funnel?window=3600"                    # view -> click -> purchase, windowFunnel
+curl "localhost:8080/retention?day=2026-08-18&days=7"       # who came back, retention()
+curl "localhost:8080/stats/top-users?n=3"                   # argMax + window function
 curl localhost:8080/stats                                   # aggregates the raw table
 curl "localhost:8080/stats/minutes?from=2026-09-01T00:00:00Z&to=2026-09-01T01:00:00Z"   # reads the rollup
 ```
@@ -357,6 +360,57 @@ SELECT name, status, element_count, formatReadableSize(bytes_allocated) AS memor
 SELECT dictGet('users_dict', 'country', toUInt64(7));
 SELECT country FROM users FINAL WHERE user_id = 7;
 SELECT argMax(country, updated_at) FROM users WHERE user_id = 7;
+```
+
+## Analytics that ClickHouse makes easy
+
+No new schema here, only queries, each built on a function that exists because ClickHouse expects
+you to compute over a user's whole history as one row rather than self-join an events table.
+
+- **Funnel.** `windowFunnel(window)(ts, cond1, cond2, cond3)` walks each user's events in time
+  order and returns how many steps of the chain happened in sequence within the window. A
+  `GROUP BY user_id` turns the per-user level into funnel counts. `Repository.Funnel`.
+- **Retention.** `retention(cond0, cond1, ...)` yields per user an array of flags where flag *i* is
+  set only if condition 0 also holds; `sumForEach` adds those arrays across users. Cohorts and
+  "came back on day N" fall out of one aggregation. `Repository.Retention`.
+- **argMax and window functions.** `argMax(payload.page, ts)` returns one column's value at
+  another's maximum, in one pass. `row_number() OVER (PARTITION BY country ORDER BY events DESC)`
+  ranks the aggregated rows. `Repository.TopUsersByCountry` uses both, plus the dictionary from
+  the previous section.
+
+Measured on the 5M seeded rows over 30 days:
+
+| query | rows read | time | memory |
+|---|---|---|---|
+| funnel, 100k users | 5.0M | 211 ms | 178 MiB |
+| retention, 8 days | 3.9M | 54 ms | 51 MiB |
+| top users per country | 5.0M | 126 ms | 145 MiB |
+
+All three are full scans, and the memory is the per-user state: a hundred thousand users each
+carrying a sorted list of timestamps, or an array of flags. That is the trade these functions make.
+They are cheap in code and in passes over the data, and their cost is one row of state per group.
+The sort key helps here too: a user's events are adjacent within each event type, so the state is
+built from mostly sequential reads.
+
+Try it yourself:
+
+```sql
+-- funnel levels rather than cumulative counts
+SELECT level, count() FROM (
+  SELECT user_id, windowFunnel(3600)(toDateTime(ts), event_type = 'view', event_type = 'click', event_type = 'purchase') AS level
+  FROM events GROUP BY user_id) GROUP BY level ORDER BY level;
+
+-- the array style: one user's history as arrays, then compute on them
+SELECT user_id, groupArray(event_type) AS types, arrayCount(x -> x = 'purchase', types) AS purchases
+FROM (SELECT user_id, event_type FROM events WHERE user_id = 11298 ORDER BY ts) GROUP BY user_id;
+
+-- sessions with a 30 minute gap rule, no session table needed
+SELECT user_id, count() AS sessions FROM (
+  SELECT user_id, ts, ts - lagInFrame(ts) OVER (PARTITION BY user_id ORDER BY ts) AS gap
+  FROM events WHERE user_id IN (11298, 18560)) WHERE gap = 0 OR gap > 1800 GROUP BY user_id;
+
+-- quantiles are approximate and cheap by default; quantileExact is the honest one
+SELECT quantiles(0.5, 0.9, 0.99)(events) FROM (SELECT user_id, count() AS events FROM events GROUP BY user_id);
 ```
 
 ## Tests

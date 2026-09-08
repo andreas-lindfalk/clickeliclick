@@ -356,3 +356,78 @@ func TestEventsByCountryUsesDictionary(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []CountryCount{{Country: "SE", Events: 3}, {Country: "", Events: 1}}, got)
 }
+
+func TestFunnel(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	t0 := recentMinute().Add(-3 * time.Hour)
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		// user 1: all three steps, in order, within the hour
+		{TS: t0, UserID: 1, EventType: "view"},
+		{TS: t0.Add(5 * time.Minute), UserID: 1, EventType: "click"},
+		{TS: t0.Add(10 * time.Minute), UserID: 1, EventType: "purchase"},
+		// user 2: view then click, never purchases
+		{TS: t0, UserID: 2, EventType: "view"},
+		{TS: t0.Add(time.Minute), UserID: 2, EventType: "click"},
+		// user 3: purchases without clicking first; the chain stops at view
+		{TS: t0, UserID: 3, EventType: "view"},
+		{TS: t0.Add(time.Minute), UserID: 3, EventType: "purchase"},
+		// user 4: clicks but never viewed; never enters the funnel
+		{TS: t0, UserID: 4, EventType: "click"},
+		// user 5: view, then a click two hours later, outside the window
+		{TS: t0, UserID: 5, EventType: "view"},
+		{TS: t0.Add(2 * time.Hour), UserID: 5, EventType: "click"},
+	}))
+
+	f, err := repo.Funnel(ctx, t0.Add(-time.Minute), t0.Add(3*time.Hour), time.Hour)
+	require.NoError(t, err)
+	require.Equal(t, &Funnel{Viewed: 4, Clicked: 2, Purchased: 1}, f)
+}
+
+func TestRetention(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	day := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -10)
+	on := func(d int) time.Time { return day.AddDate(0, 0, d).Add(12 * time.Hour) }
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		{TS: on(0), UserID: 1, EventType: "view"}, {TS: on(1), UserID: 1, EventType: "view"}, {TS: on(3), UserID: 1, EventType: "view"},
+		{TS: on(0), UserID: 2, EventType: "view"}, {TS: on(1), UserID: 2, EventType: "view"},
+		{TS: on(0), UserID: 3, EventType: "view"},
+		{TS: on(1), UserID: 4, EventType: "view"}, // not active on day 0: does not count
+	}))
+
+	res, err := repo.Retention(ctx, day, 4)
+	require.NoError(t, err)
+	require.True(t, res.Day.Equal(day))
+	require.Equal(t, []uint64{3, 2, 0, 1, 0}, res.Days)
+}
+
+func TestTopUsersByCountry(t *testing.T) {
+	repo := NewRepository(testServer.NewClient(t))
+	ctx := context.Background()
+
+	require.NoError(t, repo.UpsertUsers(ctx, []User{
+		{UserID: 1, Country: "SE"}, {UserID: 2, Country: "SE"}, {UserID: 3, Country: "DE"},
+	}))
+	require.NoError(t, repo.ReloadUserLookup(ctx))
+
+	t0 := recentMinute()
+	page := func(p string) json.RawMessage { return json.RawMessage(`{"page":"` + p + `"}`) }
+	require.NoError(t, repo.InsertEvents(ctx, []Event{
+		{TS: t0, UserID: 1, EventType: "view", Payload: page("/a")},
+		{TS: t0.Add(time.Second), UserID: 1, EventType: "view", Payload: page("/b")},
+		{TS: t0.Add(2 * time.Second), UserID: 1, EventType: "view", Payload: page("/c")},
+		{TS: t0, UserID: 2, EventType: "view", Payload: page("/x")},
+		{TS: t0, UserID: 3, EventType: "view", Payload: page("/y")},
+		{TS: t0.Add(time.Second), UserID: 3, EventType: "view", Payload: page("/z")},
+	}))
+
+	got, err := repo.TopUsersByCountry(ctx, t0, t0.Add(time.Minute), 1)
+	require.NoError(t, err)
+	require.Equal(t, []TopUser{
+		{Country: "DE", UserID: 3, Events: 2, LastPage: "/z"},
+		{Country: "SE", UserID: 1, Events: 3, LastPage: "/c"},
+	}, got)
+}

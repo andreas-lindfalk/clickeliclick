@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"clickeliclick/internal/pkg/clickhouse"
@@ -289,6 +290,101 @@ func (r *Repository) EventsByCountry(ctx context.Context, from, to time.Time) ([
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// Funnel uses windowFunnel, which walks each user's events in time order and
+// reports how many steps of the chain happened in sequence within window.
+// The GROUP BY user_id turns a user's whole history into one row; there is
+// no self-join. windowFunnel wants a plain DateTime, hence the cast.
+func (r *Repository) Funnel(ctx context.Context, from, to time.Time, window time.Duration) (*Funnel, error) {
+	var f Funnel
+	err := r.client.QueryRow(ctx, `
+		SELECT countIf(level >= 1), countIf(level >= 2), countIf(level >= 3)
+		FROM (
+			SELECT user_id,
+			       windowFunnel({window:UInt32})(toDateTime(ts),
+			           event_type = 'view', event_type = 'click', event_type = 'purchase') AS level
+			FROM events
+			WHERE ts >= {from:DateTime} AND ts < {to:DateTime}
+			GROUP BY user_id
+		)`,
+		cl.Named("window", uint32(window.Seconds())),
+		cl.Named("from", from.UTC().Format(time.DateTime)),
+		cl.Named("to", to.UTC().Format(time.DateTime)),
+	).Scan(&f.Viewed, &f.Clicked, &f.Purchased)
+	if err != nil {
+		return nil, fmt.Errorf("query funnel: %w", err)
+	}
+	return &f, nil
+}
+
+// Retention uses the retention() aggregate: per user it yields an array of
+// flags, one per condition, where flag i is set only if condition 1 (active
+// on day) also holds. sumForEach then adds the arrays element-wise across
+// users, which is the array style of aggregation ClickHouse favours.
+func (r *Repository) Retention(ctx context.Context, day time.Time, days int) (*Retention, error) {
+	if days < 1 || days > 30 {
+		return nil, fmt.Errorf("days must be 1..30, got %d", days)
+	}
+	conds := make([]string, 0, days+1)
+	for i := 0; i <= days; i++ {
+		conds = append(conds, fmt.Sprintf("toDate(ts) = toDate({day:String}) + %d", i))
+	}
+	res := Retention{Day: day.UTC().Truncate(24 * time.Hour)}
+	err := r.client.QueryRow(ctx, fmt.Sprintf(`
+		SELECT sumForEach(r)
+		FROM (
+			SELECT user_id, retention(%s) AS r
+			FROM events
+			WHERE toDate(ts) BETWEEN toDate({day:String}) AND toDate({day:String}) + {days:UInt8}
+			GROUP BY user_id
+		)`, strings.Join(conds, ", ")),
+		cl.Named("day", res.Day.Format(time.DateOnly)),
+		cl.Named("days", uint8(days)),
+	).Scan(&res.Days)
+	if err != nil {
+		return nil, fmt.Errorf("query retention: %w", err)
+	}
+	return &res, nil
+}
+
+// TopUsersByCountry ranks users by event count within their country using a
+// window function over an aggregation, and picks each user's most recent page
+// with argMax, which returns the value of one column at the maximum of
+// another without a second pass.
+func (r *Repository) TopUsersByCountry(ctx context.Context, from, to time.Time, n int) ([]TopUser, error) {
+	rows, err := r.client.Query(ctx, `
+		SELECT country, user_id, events, last_page
+		FROM (
+			SELECT dictGet('users_dict', 'country', user_id) AS country,
+			       user_id,
+			       count() AS events,
+			       argMax(payload.page, ts) AS last_page,
+			       row_number() OVER (PARTITION BY country ORDER BY events DESC, user_id) AS rn
+			FROM events
+			WHERE ts >= {from:DateTime} AND ts < {to:DateTime}
+			GROUP BY country, user_id
+		)
+		WHERE rn <= {n:UInt32}
+		ORDER BY country, rn`,
+		cl.Named("from", from.UTC().Format(time.DateTime)),
+		cl.Named("to", to.UTC().Format(time.DateTime)),
+		cl.Named("n", uint32(n)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query top users: %w", err)
+	}
+	defer rows.Close()
+
+	out := []TopUser{}
+	for rows.Next() {
+		var u TopUser
+		if err := rows.Scan(&u.Country, &u.UserID, &u.Events, &u.LastPage); err != nil {
+			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		out = append(out, u)
 	}
 	return out, rows.Err()
 }

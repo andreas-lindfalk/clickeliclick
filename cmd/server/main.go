@@ -157,6 +157,76 @@ func main() {
 		writeJSON(w, counts)
 	})
 
+	// GET /funnel?from&to&window=3600 — users who viewed, then clicked, then
+	// purchased within `window` seconds, over the time range.
+	mux.HandleFunc("GET /funnel", func(w http.ResponseWriter, r *http.Request) {
+		from, to, err := timeWindow(r, 30*24*time.Hour)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		window := time.Hour
+		if v := r.URL.Query().Get("window"); v != "" {
+			secs, err := strconv.Atoi(v)
+			if err != nil || secs <= 0 {
+				http.Error(w, "window must be a positive number of seconds", http.StatusBadRequest)
+				return
+			}
+			window = time.Duration(secs) * time.Second
+		}
+		f, err := repo.Funnel(r.Context(), from, to, window)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, f)
+	})
+
+	// GET /retention?day=2026-09-01&days=7 — of users active on day, how many
+	// came back on each of the following days.
+	mux.HandleFunc("GET /retention", func(w http.ResponseWriter, r *http.Request) {
+		day, err := time.Parse(time.DateOnly, r.URL.Query().Get("day"))
+		if err != nil {
+			http.Error(w, "day must be YYYY-MM-DD", http.StatusBadRequest)
+			return
+		}
+		days := 7
+		if v := r.URL.Query().Get("days"); v != "" {
+			if days, err = strconv.Atoi(v); err != nil {
+				http.Error(w, "days must be a number", http.StatusBadRequest)
+				return
+			}
+		}
+		res, err := repo.Retention(r.Context(), day, days)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, res)
+	})
+
+	// GET /stats/top-users?n=3&from&to — most active users per country.
+	mux.HandleFunc("GET /stats/top-users", func(w http.ResponseWriter, r *http.Request) {
+		from, to, err := timeWindow(r, 30*24*time.Hour)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		n := 3
+		if v := r.URL.Query().Get("n"); v != "" {
+			if n, err = strconv.Atoi(v); err != nil || n <= 0 {
+				http.Error(w, "n must be a positive number", http.StatusBadRequest)
+				return
+			}
+		}
+		users, err := repo.TopUsersByCountry(r.Context(), from, to, n)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, users)
+	})
+
 	// GET /pages?ref=google — top pages for one referrer, grouped on a JSON path.
 	mux.HandleFunc("GET /pages", func(w http.ResponseWriter, r *http.Request) {
 		ref := r.URL.Query().Get("ref")

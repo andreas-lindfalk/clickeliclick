@@ -51,3 +51,26 @@ type CountryCount struct {
 	Country string `json:"country"`
 	Events  uint64 `json:"events"`
 }
+
+// Funnel counts users who reached each step of view -> click -> purchase, in
+// order, within a time window per user.
+type Funnel struct {
+	Viewed    uint64 `json:"viewed"`
+	Clicked   uint64 `json:"clicked"`
+	Purchased uint64 `json:"purchased"`
+}
+
+// Retention counts, for users active on Day, how many were active again on
+// each following day. Days[0] is Day itself, Days[1] the day after, and so on.
+type Retention struct {
+	Day  time.Time `json:"day"`
+	Days []uint64  `json:"days"`
+}
+
+// TopUser is a user ranked by event count within their country.
+type TopUser struct {
+	Country  string `json:"country"`
+	UserID   uint64 `json:"user_id"`
+	Events   uint64 `json:"events"`
+	LastPage string `json:"last_page"`
+}
