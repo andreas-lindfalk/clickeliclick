@@ -98,13 +98,17 @@ Add a new file as `migrations/00N_name.sql` with `-- +goose Up` / `-- +goose Dow
 
 ## Config
 
-| env                   | default          |
-|-----------------------|------------------|
-| `CLICKHOUSE_ADDR`     | `localhost:9000` |
-| `CLICKHOUSE_DB`       | `poc`            |
-| `CLICKHOUSE_USER`     | `default`        |
-| `CLICKHOUSE_PASSWORD` | empty            |
-| `HTTP_ADDR`           | `:8080`          |
+| env                         | default            |                                          |
+|-----------------------------|--------------------|------------------------------------------|
+| `CLICKHOUSE_ADDR`           | `localhost:9000`   |                                          |
+| `CLICKHOUSE_DB`             | `poc`              |                                          |
+| `CLICKHOUSE_USER`           | `default`          |                                          |
+| `CLICKHOUSE_PASSWORD`       | empty              |                                          |
+| `CLICKHOUSE_AGENT_USER`     | `agent`            | restricted user for `make chat`, migration 007 |
+| `CLICKHOUSE_AGENT_PASSWORD` | `agent`            |                                          |
+| `ANTHROPIC_API_KEY`         |                    | required by `make chat`                  |
+| `ANTHROPIC_MODEL`           | `claude-sonnet-5`  |                                          |
+| `HTTP_ADDR`                 | `:8080`            |                                          |
 
 ## Reading less
 
@@ -456,9 +460,63 @@ SELECT event_time, query_duration_ms, read_rows, log_comment, query
 FROM system.query_log WHERE user = 'agent' AND type = 'QueryFinish' ORDER BY event_time DESC LIMIT 10;
 ```
 
+### The tool layer
+
+`internal/agent` holds what the model can call. A `Tool` is a name, a description the model reads,
+a JSON schema for its input, and the call. Two tools so far, both bound to a connection as the
+`agent` user and to a conversation id:
+
+- `describe_schema` reads `system.tables` and `system.columns` as the agent, so it lists exactly
+  what the grants allow, and adds in prose what those tables cannot say: the dictionary (a dictGet
+  grant does not make it visible), the 30 day policy, the result cap, and the `-Merge` rule.
+- `run_sql` runs one SELECT. Its own validation is only there for fast, clear errors; the fence is
+  the ClickHouse user. Results come back as JSON with positional rows plus `rows_read`, so the model
+  sees what its query cost. Output is capped at 32 KiB and marked `truncated` when cut. ClickHouse
+  errors are returned to the model verbatim, which is the point of `result_overflow_mode = 'throw'`.
+
+Two things the driver taught me here. clickhouse-go turns a context deadline into a
+`max_execution_time` query setting, which `readonly = 1` rejects; the tool hides the deadline from
+the driver and lets the server's own limit be the timeout. And the driver reports the JSON column's
+scan type as its own JSON struct even when the server has been told to send text, so that column is
+scanned into a string by name.
+
+Every query the tools run carries the conversation id in `log_comment`:
+
+```sql
+SELECT log_comment, read_rows, query_duration_ms, query FROM system.query_log
+WHERE user = 'agent' AND type = 'QueryFinish' ORDER BY event_time DESC LIMIT 10;
+```
+
+### The loop
+
+`internal/agent/agent.go` is the whole agent: about sixty lines and no framework. Send the history
+plus the tool definitions, and if the reply contains `tool_use` blocks, run them, append the
+results as one user turn, and go again. Stop when the model answers in text, or after eight rounds.
+The API is stateless, so the full history goes up on every call; `Conversation` holds it.
+
+Errors from a tool are sent back as `is_error` results, not raised. The model reading "Limit for
+result exceeded" and rewriting its query is the loop working as intended. The Anthropic client is
+behind a one-method `Model` interface, so `agent_test.go` drives the loop with a scripted fake and
+asserts on the JSON that would go over the wire: no API key, no container.
+
+```sh
+export ANTHROPIC_API_KEY=...
+make chat                     # ANTHROPIC_MODEL overrides the default claude-sonnet-5
+```
+
+The REPL prints every tool call in dim text, so you see the SQL the model writes before you see
+its answer. Things to ask: "what does the funnel from view to purchase look like over the last
+week?", "which country has the most purchases per user?", "list every event for user 7" (watch it
+hit the result cap and recover). Then, as the default user:
+
+```sql
+SELECT event_time, query_duration_ms, read_rows, query FROM system.query_log
+WHERE log_comment = 'chat-...' AND type = 'QueryFinish' ORDER BY event_time;
+```
+
 ## Tests
 
-Integration tests live in `internal/app/repository_test.go` and `internal/agent/guardrails_test.go`. They start a throwaway ClickHouse via
+Integration tests live in `internal/app/repository_test.go` and `internal/agent/*_test.go`. They start a throwaway ClickHouse via
 [testcontainers-go](https://golang.testcontainers.org/modules/clickhouse/), run the embedded migrations,
 and exercise the client with `testify/require`. One container is shared across the package; each test
 truncates the table first.
