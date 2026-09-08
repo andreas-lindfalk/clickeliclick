@@ -27,3 +27,13 @@ func env(key, def string) string {
 	}
 	return def
 }
+
+// AgentConfigFromEnv is ConfigFromEnv with the restricted user from
+// migration 007. CLICKHOUSE_AGENT_USER and CLICKHOUSE_AGENT_PASSWORD
+// override the defaults baked into that migration.
+func AgentConfigFromEnv() Config {
+	cfg := ConfigFromEnv()
+	cfg.User = env("CLICKHOUSE_AGENT_USER", "agent")
+	cfg.Password = env("CLICKHOUSE_AGENT_PASSWORD", "agent")
+	return cfg
+}

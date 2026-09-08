@@ -13,6 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anthropics/anthropic-sdk-go"
+
+	"clickeliclick/internal/agent"
+	"clickeliclick/internal/agent/tools"
 	"clickeliclick/internal/app"
 	"clickeliclick/internal/pkg/clickhouse"
 )
@@ -270,6 +274,52 @@ func main() {
 		}
 		writeJSON(w, stats)
 	})
+
+	// POST /chat {"conversation_id":"chat-...","question":"..."}; omit the
+	// id to start a conversation. The agent talks to ClickHouse through a
+	// second connection as the restricted user, never through repo's.
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		log.Print("ANTHROPIC_API_KEY not set, POST /chat disabled")
+	} else {
+		agentCh, err := clickhouse.New(ctx, clickhouse.AgentConfigFromEnv())
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer agentCh.Close()
+		modelID := os.Getenv("ANTHROPIC_MODEL")
+		if modelID == "" {
+			modelID = "claude-sonnet-5"
+		}
+		client := anthropic.NewClient()
+		chat := agent.NewChat(&client.Messages, modelID, func(id string) []agent.Tool { return tools.New(agentCh, id).All() })
+		chat.OnToolCall = func(name string, input json.RawMessage, _ string, err error) {
+			log.Printf("tool %s %s err=%v", name, input, err)
+		}
+
+		mux.HandleFunc("POST /chat", func(w http.ResponseWriter, r *http.Request) {
+			var in struct {
+				ConversationID string `json:"conversation_id"`
+				Question       string `json:"question"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Question == "" {
+				http.Error(w, "want {\"question\": \"...\"}", http.StatusBadRequest)
+				return
+			}
+			if in.ConversationID == "" {
+				in.ConversationID = chat.Start()
+			}
+			answer, err := chat.Ask(r.Context(), in.ConversationID, in.Question)
+			if errors.Is(err, agent.ErrNoConversation) {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			writeJSON(w, map[string]string{"conversation_id": in.ConversationID, "answer": answer})
+		})
+	}
 
 	srv := &http.Server{Addr: httpAddr, Handler: mux}
 

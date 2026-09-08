@@ -98,3 +98,9 @@ func (s *Server) Close() error {
 	}
 	return testcontainers.TerminateContainer(s.Container)
 }
+
+// Config returns the connection details for the default user, so tests can
+// derive connections for other users (see migration 007).
+func (s *Server) Config() clickhouse.Config {
+	return s.cfg
+}
