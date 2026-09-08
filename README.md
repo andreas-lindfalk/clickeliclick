@@ -14,6 +14,7 @@ Each section below is one step, with a migration, a repository method, a test, a
 - `cmd/chat/main.go` — terminal REPL: an LLM with tools over the data
 - `internal/agent/` — the tool loop and conversation registry (Anthropic SDK, no ClickHouse)
 - `internal/agent/tools/` — what the model may run, as the restricted user from migration 007
+- `internal/agent/eval/` — questions with known answers for the real model; build-tagged, run with `make eval`
 - `internal/app/` — `Event` entity and the `Repository` that owns the SQL (batch inserts, parameterised queries)
 - `internal/pkg/clickhouse/client.go` — thin wrapper around the native ClickHouse connection
 - `internal/pkg/clickhouse/clickhousetest/` — throwaway ClickHouse container for integration tests
@@ -550,6 +551,22 @@ make audit ID=chat-1a2b3c4d
 ```
 
 Without the key the endpoint is not registered; the rest of the service works as before.
+
+### An eval set
+
+The loop tests prove the plumbing. Whether the model picks `funnel` over `run_sql`, writes
+`countMerge` for the rollup, or recovers from the 200-row cap is only visible by chatting, and
+changes silently when the prompt, a tool description, or the model changes. `internal/agent/eval`
+has five questions with known answers, run against the real model and the seeded local database.
+Expected numbers are computed from the same database in the test, and two of the checks assert on
+what the agent did (which tools it called, that the row count is unchanged after "delete") rather
+than on what it said.
+
+It sits behind the `eval` build tag, so `make test` never compiles it. Run it on purpose:
+
+```sh
+ANTHROPIC_API_KEY=... make eval      # five conversations, a few cents
+```
 
 ## Tests
 
