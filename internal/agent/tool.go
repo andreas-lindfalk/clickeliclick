@@ -1,6 +1,3 @@
-// Package agent is the LLM side of the POC: tools the model may call against
-// ClickHouse as the restricted user from migration 007, and (next step) the
-// loop that lets a model call them.
 package agent
 
 import (
@@ -15,6 +12,9 @@ import (
 // An error from Call is not a failure of the program. It goes back to the
 // model as an error tool result, so a ClickHouse "limit for result exceeded"
 // becomes something the model can read and react to.
+//
+// The tools themselves live in the tools subpackage; this package knows
+// only the interface, and nothing about ClickHouse.
 type Tool interface {
 	Name() string
 	Description() string

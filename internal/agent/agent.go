@@ -1,3 +1,7 @@
+// Package agent is the LLM side of the POC: the loop that lets a model call
+// tools (agent.go), a registry of conversations (chat.go), and the Tool
+// interface both need. It depends on the Anthropic SDK and nothing else;
+// the ClickHouse tools are in the tools subpackage.
 package agent
 
 import (
@@ -23,7 +27,8 @@ type Model interface {
 // enforceable ones live in ClickHouse.
 const systemPrompt = `You are an analytics assistant for a product events dataset stored in ClickHouse.
 Answer questions by querying the data with the tools you have. Never guess or invent numbers.
-Call describe_schema once at the start of a conversation before writing SQL.
+Use the purpose-built tools (funnel, retention, top_users) when they answer the question.
+For anything else, call describe_schema once, then write SQL for run_sql.
 Prefer aggregating queries. A result over 200 rows fails, so add LIMIT when listing rows.
 If a query fails, read the error, fix the query and try again. Do not repeat a query that failed.
 When you report numbers, show the SQL you ran, briefly.

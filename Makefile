@@ -1,4 +1,4 @@
-.PHONY: up down run logs sql sql-agent chat
+.PHONY: up down run logs sql sql-agent chat audit
 
 up:        ## start ClickHouse
 	docker compose up -d
@@ -17,6 +17,9 @@ sql:       ## open an interactive clickhouse-client
 
 chat:      ## talk to the data through an LLM (needs ANTHROPIC_API_KEY)
 	go run ./cmd/chat
+
+audit:     ## what the agent ran in one conversation: make audit ID=chat-1a2b3c4d
+	docker compose exec clickhouse clickhouse-client --database poc -q "SELECT event_time, query_duration_ms, read_rows, exception_code, query FROM system.query_log WHERE user = 'agent' AND log_comment = '$(ID)' AND type != 'QueryStart' ORDER BY event_time FORMAT Vertical"
 
 sql-agent: ## same, as the restricted user the LLM agent will use
 	docker compose exec clickhouse clickhouse-client --database poc --user agent --password agent

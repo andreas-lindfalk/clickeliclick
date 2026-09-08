@@ -1,11 +1,19 @@
 # clickeliclick
 
-Minimal Go + ClickHouse playground.
+A Go + ClickHouse playground, built one step at a time: migrations, batch and async inserts, sort
+keys and projections, materialized views, the JSON type, TTL and deletes, ReplacingMergeTree and
+dictionaries, funnels and retention. Then an agent on top: an LLM that answers questions about the
+data through tools, fenced in by a read-only ClickHouse user rather than by prompt.
+
+Each section below is one step, with a migration, a repository method, a test, and queries to try.
 
 ## Layout
 
 - `cmd/server/main.go` — tiny HTTP service (insert / query / aggregate)
 - `cmd/seed/main.go` — bulk loader that fills `events` with synthetic data
+- `cmd/chat/main.go` — terminal REPL: an LLM with tools over the data
+- `internal/agent/` — the tool loop and conversation registry (Anthropic SDK, no ClickHouse)
+- `internal/agent/tools/` — what the model may run, as the restricted user from migration 007
 - `internal/app/` — `Event` entity and the `Repository` that owns the SQL (batch inserts, parameterised queries)
 - `internal/pkg/clickhouse/client.go` — thin wrapper around the native ClickHouse connection
 - `internal/pkg/clickhouse/clickhousetest/` — throwaway ClickHouse container for integration tests
@@ -37,6 +45,7 @@ curl "localhost:8080/retention?day=2026-08-18&days=7"       # who came back, ret
 curl "localhost:8080/stats/top-users?n=3"                   # argMax + window function
 curl localhost:8080/stats                                   # aggregates the raw table
 curl "localhost:8080/stats/minutes?from=2026-09-01T00:00:00Z&to=2026-09-01T01:00:00Z"   # reads the rollup
+curl localhost:8080/chat -d '{"question":"which country buys the most?"}'   # LLM + tools, needs ANTHROPIC_API_KEY
 ```
 
 Load some real volume so queries have something to work on:
@@ -422,7 +431,7 @@ SELECT quantiles(0.5, 0.9, 0.99)(events) FROM (SELECT user_id, count() AS events
 The next few steps put an LLM in front of this data, with a tool that runs SQL the model writes.
 The guardrails for that live in ClickHouse, not in a regex in Go. Migration 007 creates a user
 `agent` with a settings profile, grants, row policies and a quota, and the tests in
-`internal/agent/guardrails_test.go` try to break out of each of them.
+`internal/agent/tools/guardrails_test.go` try to break out of each of them.
 
 - `readonly = 1` allows only SELECT and freezes every setting, so the model cannot lift a cap with a
   `SETTINGS` clause. Settings marked `CHANGEABLE_IN_READONLY` are the whitelist: the driver's two
@@ -462,8 +471,10 @@ FROM system.query_log WHERE user = 'agent' AND type = 'QueryFinish' ORDER BY eve
 
 ### The tool layer
 
-`internal/agent` holds what the model can call. A `Tool` is a name, a description the model reads,
-a JSON schema for its input, and the call. Two tools so far, both bound to a connection as the
+Two packages, cut along their dependencies. `internal/agent` knows the Anthropic SDK and defines
+the `Tool` interface: a name, a description the model reads, a JSON schema for its input, and the
+call. `internal/agent/tools` knows ClickHouse and implements the tools, one file each with a
+matching test; `tools.go` has what they share. Two tools so far, both bound to a connection as the
 `agent` user and to a conversation id:
 
 - `describe_schema` reads `system.tables` and `system.columns` as the agent, so it lists exactly
@@ -497,7 +508,8 @@ The API is stateless, so the full history goes up on every call; `Conversation` 
 Errors from a tool are sent back as `is_error` results, not raised. The model reading "Limit for
 result exceeded" and rewriting its query is the loop working as intended. The Anthropic client is
 behind a one-method `Model` interface, so `agent_test.go` drives the loop with a scripted fake and
-asserts on the JSON that would go over the wire: no API key, no container.
+asserts on the JSON that would go over the wire: no API key, no container, and the whole package
+tests in well under a second because it never imports ClickHouse.
 
 ```sh
 export ANTHROPIC_API_KEY=...
@@ -505,7 +517,7 @@ make chat                     # ANTHROPIC_MODEL overrides the default claude-son
 ```
 
 The REPL prints every tool call in dim text, so you see the SQL the model writes before you see
-its answer. Things to ask: "what does the funnel from view to purchase look like over the last
+its answer. `make audit ID=chat-...` shows the same from ClickHouse's side, failures included. Things to ask: "what does the funnel from view to purchase look like over the last
 week?", "which country has the most purchases per user?", "list every event for user 7" (watch it
 hit the result cap and recover). Then, as the default user:
 
@@ -514,9 +526,34 @@ SELECT event_time, query_duration_ms, read_rows, query FROM system.query_log
 WHERE log_comment = 'chat-...' AND type = 'QueryFinish' ORDER BY event_time;
 ```
 
+### Curated tools next to SQL
+
+`funnel.go`, `retention.go` and `top_users.go` in `internal/agent/tools` wrap three repository
+methods as tools. The model fills in parameters; the SQL, its cost and the output shape are ours. They
+run through the same restricted connection as `run_sql` and carry the same conversation tag, so the
+grants and the audit trail apply to trusted queries too. The system prompt tells the model to
+prefer them and to fall back to SQL for everything else.
+
+The thing to watch, with `make chat`, is which tool the model reaches for when both could answer,
+and whether the curated answer and a SQL answer to the same question agree. In production this
+layering is the usual shape: vetted tools for the questions that matter, a fenced SQL tool for the
+long tail.
+
+`POST /chat` puts the same agent on the service, with conversations kept in memory:
+
+```sh
+ANTHROPIC_API_KEY=... make run
+curl -s localhost:8080/chat -d '{"question":"how many purchases in the last 7 days?"}'
+# {"conversation_id":"chat-1a2b3c4d","answer":"..."}
+curl -s localhost:8080/chat -d '{"conversation_id":"chat-1a2b3c4d","question":"and the week before?"}'
+make audit ID=chat-1a2b3c4d
+```
+
+Without the key the endpoint is not registered; the rest of the service works as before.
+
 ## Tests
 
-Integration tests live in `internal/app/repository_test.go` and `internal/agent/*_test.go`. They start a throwaway ClickHouse via
+Integration tests live in `internal/app/repository_test.go` and `internal/agent/tools/*_test.go`. They start a throwaway ClickHouse via
 [testcontainers-go](https://golang.testcontainers.org/modules/clickhouse/), run the embedded migrations,
 and exercise the client with `testify/require`. One container is shared across the package; each test
 truncates the table first.

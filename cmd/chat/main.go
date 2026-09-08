@@ -5,8 +5,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,6 +15,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 
 	"clickeliclick/internal/agent"
+	"clickeliclick/internal/agent/tools"
 	"clickeliclick/internal/pkg/clickhouse"
 )
 
@@ -39,12 +38,9 @@ func main() {
 	}
 	defer ch.Close()
 
-	conversationID := "chat-" + randomHex(4)
-	tools := agent.NewTools(ch, conversationID)
-
 	client := anthropic.NewClient() // reads ANTHROPIC_API_KEY
-	a := agent.New(&client.Messages, modelID, tools.All())
-	a.OnToolCall = func(name string, input json.RawMessage, output string, err error) {
+	chat := agent.NewChat(&client.Messages, modelID, func(id string) []agent.Tool { return tools.New(ch, id).All() })
+	chat.OnToolCall = func(name string, input json.RawMessage, output string, err error) {
 		fmt.Printf("\033[2m  %s %s\n", name, input)
 		if err != nil {
 			fmt.Printf("  error: %v\033[0m\n", err)
@@ -52,7 +48,7 @@ func main() {
 		}
 		fmt.Printf("  %d bytes\033[0m\n", len(output))
 	}
-	conv := a.NewConversation()
+	conversationID := chat.Start()
 
 	fmt.Printf("model %s, conversation %s\n", modelID, conversationID)
 	fmt.Printf("audit: SELECT query FROM system.query_log WHERE log_comment = '%s'\n\n", conversationID)
@@ -62,7 +58,7 @@ func main() {
 	for in.Scan() {
 		q := in.Text()
 		if q != "" {
-			answer, err := conv.Ask(ctx, q)
+			answer, err := chat.Ask(ctx, conversationID, q)
 			if err != nil {
 				fmt.Printf("error: %v\n", err)
 			} else {
@@ -74,12 +70,7 @@ func main() {
 		}
 		fmt.Print("\n> ")
 	}
-}
-
-func randomHex(n int) string {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		panic(err)
+	if err := in.Err(); err != nil {
+		log.Fatalf("read stdin: %v", err)
 	}
-	return hex.EncodeToString(b)
 }
