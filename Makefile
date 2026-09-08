@@ -1,4 +1,4 @@
-.PHONY: up down run logs sql
+.PHONY: up down run logs sql sql-agent
 
 up:        ## start ClickHouse
 	docker compose up -d
@@ -14,6 +14,9 @@ run:       ## run the Go service
 
 sql:       ## open an interactive clickhouse-client
 	docker compose exec clickhouse clickhouse-client --database poc
+
+sql-agent: ## same, as the restricted user the LLM agent will use
+	docker compose exec clickhouse clickhouse-client --database poc --user agent --password agent
 
 test:      ## run integration tests (needs Docker)
 	go test ./... -v -count=1

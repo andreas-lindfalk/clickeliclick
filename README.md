@@ -413,9 +413,52 @@ SELECT user_id, count() AS sessions FROM (
 SELECT quantiles(0.5, 0.9, 0.99)(events) FROM (SELECT user_id, count() AS events FROM events GROUP BY user_id);
 ```
 
+## A fenced-in user for an LLM agent
+
+The next few steps put an LLM in front of this data, with a tool that runs SQL the model writes.
+The guardrails for that live in ClickHouse, not in a regex in Go. Migration 007 creates a user
+`agent` with a settings profile, grants, row policies and a quota, and the tests in
+`internal/agent/guardrails_test.go` try to break out of each of them.
+
+- `readonly = 1` allows only SELECT and freezes every setting, so the model cannot lift a cap with a
+  `SETTINGS` clause. Settings marked `CHANGEABLE_IN_READONLY` are the whitelist: the driver's two
+  output settings, and `log_comment`, which the tool layer will set to the conversation id.
+- `max_execution_time`, `max_rows_to_read`, `max_memory_usage` cap one query's cost.
+- `max_result_rows = 200` with the default `result_overflow_mode = 'throw'`: an oversized result
+  fails with an error the model can read, instead of arriving silently truncated.
+- `GRANT SELECT` on three tables plus `dictGet` on the dictionary. No system tables, and table
+  functions that reach outside the server (`url`, `s3`, `remote`) need grants it does not have.
+- Row policies restrict `events` to the last 30 days. A policy is per table, so the rollup gets its
+  own; without it, older days would still be readable as aggregates.
+- A quota of 200 queries per rolling hour.
+
+Try it:
+
+```sh
+make sql-agent
+```
+
+```sql
+SELECT count(), min(ts) FROM events;                           -- fewer rows than the default user sees
+SELECT user_id FROM events;                                    -- TOO_MANY_ROWS_OR_BYTES
+SELECT count() FROM events SETTINGS max_execution_time = 100;  -- READONLY
+SELECT count() FROM system.query_log;                          -- ACCESS_DENIED
+SELECT * FROM url('http://example.com', 'RawBLOB');           -- ACCESS_DENIED, no READ ON URL
+SELECT name FROM system.tables WHERE database = 'poc';         -- only what it has SELECT on
+SELECT queries, max_queries FROM system.quota_usage;
+SHOW GRANTS;
+```
+
+Back as the default user, the audit trail is a query:
+
+```sql
+SELECT event_time, query_duration_ms, read_rows, log_comment, query
+FROM system.query_log WHERE user = 'agent' AND type = 'QueryFinish' ORDER BY event_time DESC LIMIT 10;
+```
+
 ## Tests
 
-Integration tests live in `internal/app/repository_test.go`. They start a throwaway ClickHouse via
+Integration tests live in `internal/app/repository_test.go` and `internal/agent/guardrails_test.go`. They start a throwaway ClickHouse via
 [testcontainers-go](https://golang.testcontainers.org/modules/clickhouse/), run the embedded migrations,
 and exercise the client with `testify/require`. One container is shared across the package; each test
 truncates the table first.
